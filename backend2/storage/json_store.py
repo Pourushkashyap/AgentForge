@@ -114,7 +114,61 @@ class JSONStore:
             self._write(path, records)
 
         return record
+    
+    
+    
+    def create_record_unique(
+        self,
+        collection: str,
+        record: dict[str, Any],
+        unique_fields: list[str],
+    ) -> dict[str, Any]:
+        """Create a record while enforcing uniqueness on selected fields."""
+        if not isinstance(record, dict):
+            raise ValueError("Record must be a dictionary.")
 
+        if not record.get("id"):
+            raise ValueError("Record must contain a non-empty id.")
+
+        if not unique_fields:
+            raise ValueError("At least one unique field is required.")
+
+        path = self._file_path(collection)
+
+        with self._lock:
+            records = self._read(path)
+
+            for field in unique_fields:
+                value = record.get(field)
+
+                if value is None or value == "":
+                    continue
+
+                duplicate = any(
+                    str(existing.get(field, "")).strip().lower()
+                    == str(value).strip().lower()
+                    for existing in records
+                )
+
+                if duplicate:
+                    raise ValueError(
+                        f"Record with this {field} already exists."
+                    )
+
+            if any(
+                str(item.get("id")) == str(record["id"])
+                for item in records
+            ):
+                raise ValueError(
+                    f"Record with id {record['id']} already exists."
+                )
+
+            records.append(record)
+            self._write(path, records)
+
+        return record
+
+    
     def update_record(
         self,
         collection: str,

@@ -124,8 +124,8 @@ def analyze_backend_routes(backend_dir: str | Path) -> list[dict[str, Any]]:
                 method_name = func.attr.lower()
                 methods: list[str] = []
 
-                if method_name in HTTP_METHODS:
-                    methods = [method_name.upper()]
+                if method_name.upper() in HTTP_METHODS:
+                     methods = [method_name.upper()]
                 elif method_name in {"api_route", "route"}:
                     for keyword in decorator.keywords:
                         if keyword.arg == "methods":
