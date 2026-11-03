@@ -44,9 +44,27 @@ MAX_RETRY_WAIT_SECONDS = 20.0
 _STRAY_LINE = re.compile(r"^\s*[A-Za-z_][\w ]*\s*:\s*\S")
 
 
+
+
 def repair_json_text(text: str) -> str | None:
-    """Return valid JSON text repaired from ``text``, or None if impossible."""
-    candidate = (text or "").strip().replace("**", "")
+    """Repair common JSON formatting errors without inventing missing data."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    candidate = (text or "").strip()
+
+    # Remove Markdown JSON fences.
+    fence = re.match(
+        r"^```(?:json)?\s*(.*?)\s*```$",
+        candidate,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if fence:
+        candidate = fence.group(1).strip()
+
+    # Remove accidental bold markers around JSON keys.
+    candidate = candidate.replace("**", "")
+
     for _ in range(40):
         try:
             json.loads(candidate)
@@ -55,15 +73,21 @@ def repair_json_text(text: str) -> str | None:
             lines = candidate.splitlines()
             index = err.lineno - 1
             bad = lines[index] if 0 <= index < len(lines) else ""
-            if _STRAY_LINE.match(bad):  # unquoted key such as: Loading: false,
+
+            # Remove stray unquoted lines, e.g. Loading: false,
+            if _STRAY_LINE.match(bad):
                 del lines[index]
                 candidate = "\n".join(lines)
                 continue
-            without_trailing_commas = re.sub(r",(\s*[}\]])", r"\1", candidate)
-            if without_trailing_commas != candidate:
-                candidate = without_trailing_commas
+
+            # Remove trailing commas before } or ].
+            repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
+            if repaired != candidate:
+                candidate = repaired
                 continue
+
             return None
+
     return None
 
 

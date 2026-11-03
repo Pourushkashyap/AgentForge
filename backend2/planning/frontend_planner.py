@@ -12,29 +12,71 @@ from planning.schemas import MasterPlan
 
 
 def normalize_api_integrations(plan: FrontendPlan) -> FrontendPlan:
-    """Keep only API calls the generated backend can actually serve.
+    """Normalize CRUD APIs but preserve specialized authentication APIs."""
 
-    The frontend plan owns the API contract in the frontend-first pipeline.
-    Paths are rewritten to the canonical /api/<resource>[/{id}] form, field
-    names are reduced to plain names, duplicates are removed, and calls that
-    the backend generator cannot serve (nested paths, auth routes, wrong
-    methods...) are dropped.
-    """
     cleaned: list[APIIntegration] = []
     seen: set[tuple[str, str]] = set()
 
+    auth_actions = {
+        "/api/auth/register",
+        "/api/auth/signup",
+        "/api/auth/login",
+        "/api/auth/logout",
+        "/api/auth/me",
+        "/api/auth/refresh",
+        "/api/users/register",
+        "/api/users/login",
+    }
+
     for integration in plan.api_integrations:
+        method = str(integration.method or "").strip().upper()
+        path = str(integration.endpoint or "").strip().rstrip("/")
+
+        if not path.startswith("/"):
+            path = "/" + path
+
+        # Preserve explicitly supported authentication actions.
+        if path in auth_actions:
+            if method not in {"GET", "POST"}:
+                continue
+
+            key = (method, path)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            cleaned.append(
+                APIIntegration(
+                    name=integration.name,
+                    endpoint=path,
+                    method=method,
+                    purpose=integration.purpose,
+                    request_fields=integration.request_fields,
+                    response_fields=integration.response_fields,
+                    authentication_required=(
+                        False
+                        if path.endswith(("/register", "/signup", "/login"))
+                        else integration.authentication_required
+                    ),
+                )
+            )
+            continue
+
+        # Existing CRUD normalization remains unchanged.
         item = normalize_requirement(
             {
                 "name": integration.name,
-                "method": integration.method,
-                "path": integration.endpoint,
+                "method": method,
+                "path": path,
                 "purpose": integration.purpose,
                 "request_fields": integration.request_fields,
                 "response_fields": integration.response_fields,
-                "authentication_required": integration.authentication_required,
+                "authentication_required": (
+                    integration.authentication_required
+                ),
             }
         )
+
         if item is None:
             continue
 

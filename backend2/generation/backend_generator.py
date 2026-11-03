@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 from planning.backend_schemas import BackendPlan
-
+from generation.api_endpoints import normalize_action_endpoint
 
 _STRING_FIELD_RE = re.compile(
     r"^(?:image|img|photo|picture|thumbnail|banner|cover|avatar|logo|icon)"
@@ -45,6 +45,255 @@ def safe_field_name(value: str, fallback: str = "field") -> str:
         name += "_field"
 
     return name
+
+
+
+def build_auth_config(endpoints):
+    """Detect whether the backend plan requires authentication."""
+
+    auth_routes = {}
+
+    for endpoint in endpoints:
+        data = (
+            endpoint
+            if isinstance(endpoint, dict)
+            else endpoint.model_dump()
+        )
+
+        method = str(data.get("method", "")).upper()
+        path = str(data.get("path", "")).strip()
+        endpoint_type = data.get("endpoint_type")
+
+        action = normalize_action_endpoint(
+            method,
+            path,
+            endpoint_type,
+        )
+
+        if action:
+            _, canonical_path, inferred_type = action
+            auth_routes[(method, canonical_path)] = inferred_type
+
+    has_registration = any(
+        endpoint_type == "registration"
+        for endpoint_type in auth_routes.values()
+    )
+
+    has_login = any(
+        endpoint_type == "authentication"
+        and method == "POST"
+        and path in {
+            "/api/auth/login",
+            "/api/users/login",
+        }
+        for (method, path), endpoint_type in auth_routes.items()
+    )
+
+    if has_registration != has_login:
+        raise ValueError(
+            "Authentication requires both registration and login "
+            "endpoints. Add POST /api/auth/register and "
+            "POST /api/auth/login to the backend plan."
+        )
+
+    return {
+        "enabled": has_registration and has_login,
+        "routes": auth_routes,
+    }
+
+
+
+def build_auth_routes(auth_config):
+    """Generate secure registration, login and current-user routes."""
+
+    if not auth_config["enabled"]:
+        return ""
+
+    routes = auth_config["routes"]
+
+    register_path = next(
+        path for (method, path), kind in routes.items()
+        if method == "POST" and kind == "registration"
+    )
+
+    login_path = next(
+        path for (method, path), kind in routes.items()
+        if method == "POST"
+        and kind == "authentication"
+        and path in {"/api/auth/login", "/api/users/login"}
+    )
+
+    me_path = "/api/auth/me"
+
+    return f'''
+class RegisterInput(BaseModel):
+    name: str = Field(default="User", min_length=1, max_length=100)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class LoginInput(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+
+
+password_hasher = PasswordHasher()
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
+
+if not JWT_SECRET_KEY:
+    raise RuntimeError(
+        "JWT_SECRET_KEY environment variable is required."
+    )
+
+JWT_ALGORITHM = "HS256"
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(
+    os.environ.get("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "60")
+)
+
+
+def public_user(user):
+    return {{
+        "id": user["id"],
+        "name": user.get("name", "User"),
+        "email": user["email"],
+        "role": user.get("role", "user"),
+    }}
+
+
+def create_access_token(user):
+    now = datetime.now(timezone.utc)
+    payload = {{
+        "sub": str(user["id"]),
+        "iat": now,
+        "exp": now + timedelta(
+            minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+        ),
+    }}
+    return jwt.encode(
+        payload,
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+            headers={{"WWW-Authenticate": "Bearer"}},
+        )
+
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+            options={{"require": ["sub", "exp"]}},
+        )
+        user_id = payload.get("sub")
+        if not user_id:
+            raise ValueError("Missing subject")
+    except (jwt.InvalidTokenError, ValueError):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired access token",
+            headers={{"WWW-Authenticate": "Bearer"}},
+        )
+
+    user = store.get_record("users", str(user_id))
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User no longer exists",
+        )
+
+    return user
+
+
+@app.post({json.dumps(register_path)}, status_code=201)
+def register_user(payload: RegisterInput):
+    email = payload.email.strip().lower()
+
+    if not re.fullmatch(r"[^@\\s]+@[^@\\s]+\\.[^@\\s]+", email):
+        raise HTTPException(status_code=422, detail="Invalid email address")
+
+    user = {{
+        "id": str(uuid.uuid4()),
+        "name": payload.name.strip() or "User",
+        "email": email,
+        "password_hash": password_hasher.hash(payload.password),
+        "role": "user",
+    }}
+
+    try:
+        created = store.create_record_unique(
+            "users",
+            user,
+            unique_fields=["email"],
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists",
+        )
+
+    return public_user(created)
+
+
+@app.post({json.dumps(login_path)})
+def login_user(payload: LoginInput):
+    email = payload.email.strip().lower()
+
+    user = next(
+        (
+            item for item in store.list_records("users")
+            if item.get("email", "").strip().lower() == email
+        ),
+        None,
+    )
+
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password",
+        )
+
+    try:
+        password_hasher.verify(
+            user["password_hash"],
+            payload.password,
+        )
+    except (VerifyMismatchError, InvalidHash):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password",
+        )
+
+    if password_hasher.check_needs_rehash(user["password_hash"]):
+        user["password_hash"] = password_hasher.hash(payload.password)
+        store.update_record("users", user["id"], {{
+            "password_hash": user["password_hash"]
+        }})
+
+    return {{
+        "access_token": create_access_token(user),
+        "token_type": "bearer",
+        "expires_in": JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": public_user(user),
+    }}
+
+
+@app.get({json.dumps(me_path)})
+def get_me(current_user: dict = Depends(get_current_user)):
+    return public_user(current_user)
+@app.post("/api/auth/logout")
+def logout_user():
+    return {{"message": "Logged out. Clear the access token on the client."}}    
+'''
+
 
 
 def build_planned_routes(endpoints, models):
@@ -96,6 +345,16 @@ def build_planned_routes(endpoints, models):
         data = endpoint if isinstance(endpoint, dict) else endpoint.model_dump()
         method = str(data.get("method", "")).upper()
         path = str(data.get("path", "")).strip().rstrip("/")
+        
+        action = normalize_action_endpoint(
+            method,
+            path,
+            data.get("endpoint_type"),
+        )
+
+        if action:
+            # Authentication handlers are generated separately.
+            continue
 
         if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
             raise ValueError(f"Unsupported endpoint method: {method} {path}")
@@ -353,10 +612,35 @@ def generate_backend_project(
         if not collection_file.exists():
             collection_file.write_text("[]\n", encoding="utf-8")
 
+    auth_config = build_auth_config(plan.endpoints)
+    auth_enabled = auth_config["enabled"]
+
+    if auth_enabled:
+        # Authentication always uses the dedicated users collection.
+        if "users" not in used_collections:
+            used_collections.add("users")
+
+            models.append({
+                "name": "User",
+                "collection": "users",
+                "fields": [
+                    {"name": "id", "type": "str", "required": False},
+                    {"name": "name", "type": "str", "required": False},
+                    {"name": "email", "type": "str", "required": True},
+                    {"name": "password_hash", "type": "str", "required": True},
+                    {"name": "role", "type": "str", "required": False},
+                ],
+            })
+
+        users_file = data_dir / "users.json"
+        if not users_file.exists():
+            users_file.write_text("[]\n", encoding="utf-8")
+    
+    
     generated_main = r'''
 import uuid
 from pathlib import Path
-
+__AUTH_IMPORTS__
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import ConfigDict, create_model
@@ -426,6 +710,7 @@ def validate_payload(collection: str, payload: dict) -> dict:
 
     return validated.model_dump(exclude_unset=True)
 
+__AUTH_ROUTES__
 
 @app.get("/health")
 def health():
@@ -457,7 +742,40 @@ async def upload_image(file: UploadFile = File(...)):
 
 
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+
 '''
+
+    auth_imports = ""
+    auth_routes = ""
+
+    if auth_enabled:
+        auth_imports = """
+import os
+import re
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHash, VerifyMismatchError
+from fastapi import Depends
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
+
+bearer_scheme = HTTPBearer(auto_error=False)
+"""
+
+        auth_routes = build_auth_routes(auth_config)
+
+    generated_main = generated_main.replace(
+        "__AUTH_IMPORTS__",
+        auth_imports,
+    )
+
+    generated_main = generated_main.replace(
+        "__AUTH_ROUTES__",
+        auth_routes,
+    )
 
     generated_main = generated_main.replace(
         "__PROJECT_TITLE__",
@@ -477,10 +795,29 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
         encoding="utf-8",
     )
 
+    requirements = [
+        "fastapi",
+        "uvicorn[standard]",
+        "python-multipart",
+    ]
+
+    if auth_enabled:
+        requirements.extend([
+            "argon2-cffi",
+            "PyJWT",
+        ])
+
     (project_dir / "requirements.txt").write_text(
-        "fastapi\nuvicorn[standard]\npython-multipart\n",
+        "\n".join(requirements) + "\n",
         encoding="utf-8",
     )
+
+    if auth_enabled:
+        (project_dir / ".env.example").write_text(
+            "JWT_SECRET_KEY=replace-with-a-long-random-secret\n"
+            "JWT_ACCESS_TOKEN_EXPIRE_MINUTES=60\n",
+            encoding="utf-8",
+        )
 
     readme = f"""# {plan.project_name}
 
@@ -506,8 +843,36 @@ For production, add authentication, authorization, content validation,
 and multi-process-safe storage.
 """
 
-    (project_dir / "README.md").write_text(readme, encoding="utf-8")
+    if auth_enabled:
+        readme += """
+## Authentication
 
+Authentication is enabled for this project.
+
+Set these environment variables before starting the server:
+
+```powershell
+$env:JWT_SECRET_KEY = "use-a-random-secret-of-at-least-32-characters"
+$env:JWT_ACCESS_TOKEN_EXPIRE_MINUTES = "60"
+python -m uvicorn main:app --reload
+```
+
+- Passwords are hashed using Argon2.
+- Access tokens are signed JWTs.
+- Protected routes require `Authorization: Bearer <token>`.
+- Password hashes are never returned by auth endpoints.
+- Logout is stateless; the client must discard its token.
+"""
+    else:
+        readme += "\nAuthentication is not enabled for this project.\n"
+
+    readme += """
+## Storage note
+
+JSON storage is suitable for local development and single-process use.
+Use a transactional database for multi-worker or multi-instance production.
+"""
+    (project_dir / "README.md").write_text(readme, encoding="utf-8")
     
     manifest = {
         "business_name": plan.business_name,
@@ -527,6 +892,7 @@ and multi-process-safe storage.
                 "authentication_required": data.get("authentication_required", False),
                 "request_fields": data.get("request_fields", []),
                 "response_fields": data.get("response_fields", []),
+
             }
             for data in [
                 endpoint if isinstance(endpoint, dict) else endpoint.model_dump()
@@ -537,6 +903,11 @@ and multi-process-safe storage.
             "enabled": True,
             "endpoint": "/api/uploads",
             "directory": "uploads/",
+        },
+        "authentication": {
+            "enabled": auth_enabled,
+            "user_collection": "users" if auth_enabled else None,
+            "token_type": "bearer" if auth_enabled else None,
         },
     }
 

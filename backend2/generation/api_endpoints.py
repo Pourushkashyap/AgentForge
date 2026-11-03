@@ -1,18 +1,9 @@
-"""Shared helpers for the API contract that the FRONTEND defines.
 
-In the frontend-first pipeline the generated frontend decides which API calls
-it needs. The backend generator can only serve simple JSON-store CRUD routes:
+"""Shared helpers for the frontend-first API contract.
 
-    GET    /api/<resource>          list
-    POST   /api/<resource>          create
-    GET    /api/<resource>/{id}     read one
-    PUT    /api/<resource>/{id}     replace
-    PATCH  /api/<resource>/{id}     update
-    DELETE /api/<resource>/{id}     delete
-
-Every helper here normalizes an API call into that shape (or rejects it), so
-the frontend plan, the frontend code analyzer, the backend plan and the
-backend generator all agree on exactly the same endpoints.
+CRUD endpoints are normalized separately from action endpoints such as
+registration and authentication. Action endpoints must never be interpreted
+as generic JSON-store CRUD operations.
 """
 from __future__ import annotations
 
@@ -21,7 +12,6 @@ from typing import Any, Iterable
 
 HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
 
-# Endpoints the generated backend template already provides by itself.
 BUILTIN_ENDPOINTS: tuple[dict[str, Any], ...] = (
     {
         "name": "Upload image",
@@ -31,23 +21,40 @@ BUILTIN_ENDPOINTS: tuple[dict[str, Any], ...] = (
         "request_fields": [],
         "response_fields": ["image_url"],
         "authentication_required": False,
+        "endpoint_type": "upload",
     },
 )
 _BUILTIN_KEYS = {("POST", "/api/uploads")}
 
 _RESOURCE_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_PARAM_RE = re.compile(
+    r"^(?:\{[A-Za-z_][A-Za-z0-9_]*\}|:[A-Za-z_][A-Za-z0-9_]*|\$\{[^}]*\})$"
+)
+_FIELD_RE = re.compile(r"^\s*([A-Za-z_$][\w$]*)")
 
-# Action-style names are not data collections: a JSON CRUD backend cannot
-# implement their behavior (sessions, tokens, search, payments).
 RESERVED_RESOURCES = {
     "auth", "authenticate", "login", "logout", "signin", "signout",
     "signup", "register", "token", "tokens", "refresh", "search",
     "checkout", "payment", "payments",
 }
-_PARAM_RE = re.compile(
-    r"^(?:\{[A-Za-z_][A-Za-z0-9_]*\}|:[A-Za-z_][A-Za-z0-9_]*|\$\{[^}]*\})$"
-)
-_FIELD_RE = re.compile(r"^\s*([A-Za-z_$][\w$]*)")
+
+# Only these action routes are currently supported by the auth-aware
+# backend generator. Add a route here only when its handler is implemented.
+AUTH_ACTION_ENDPOINTS = {
+    ("POST", "/api/auth/register"): "registration",
+    ("POST", "/api/auth/signup"): "registration",
+    ("POST", "/api/auth/login"): "authentication",
+    ("POST", "/api/auth/logout"): "authentication",
+    ("GET", "/api/auth/me"): "authentication",
+    ("POST", "/api/auth/refresh"): "authentication",
+    ("POST", "/api/users/register"): "registration",
+    ("POST", "/api/users/login"): "authentication",
+}
+
+ACTION_ENDPOINT_TYPES = {
+    "authentication",
+    "registration",
+}
 
 
 def field_name(value: Any) -> str | None:
@@ -69,23 +76,34 @@ def field_names(values: Iterable[Any] | None) -> list[str]:
     return names
 
 
-def normalize_path(raw: Any) -> str | None:
-    """Return a canonical '/api/<resource>[/{id}]' path, or None if the
-    backend generator cannot serve it."""
+def _clean_path(raw: Any) -> str | None:
     if not isinstance(raw, str):
         return None
 
     path = raw.strip().split("?", 1)[0].split("#", 1)[0]
     if not path:
         return None
+
     if not path.startswith("/"):
         path = "/" + path
+
     if path == "/api":
         return None
+
     if not path.startswith("/api/"):
         path = "/api" + path
 
     parts = [part for part in path.strip("/").split("/") if part]
+    return "/" + "/".join(parts) if parts else None
+
+
+def normalize_path(raw: Any) -> str | None:
+    """Normalize only collection/item CRUD paths."""
+    path = _clean_path(raw)
+    if path is None:
+        return None
+
+    parts = path.strip("/").split("/")
     if len(parts) not in (2, 3) or parts[0] != "api":
         return None
 
@@ -98,15 +116,39 @@ def normalize_path(raw: Any) -> str | None:
 
     if not _PARAM_RE.match(parts[2]):
         return None
+
     return f"/api/{resource}/{{id}}"
 
 
-def is_valid_endpoint(method: Any, raw_path: Any) -> bool:
-    return normalize_endpoint(method, raw_path) is not None
+def normalize_action_endpoint(
+    method: Any,
+    raw_path: Any,
+    endpoint_type: Any = None,
+) -> tuple[str, str, str] | None:
+    """Validate a specifically supported action endpoint."""
+    verb = str(method or "").strip().upper()
+    path = _clean_path(raw_path)
+
+    if verb not in HTTP_METHODS or path is None:
+        return None
+
+    inferred_type = AUTH_ACTION_ENDPOINTS.get((verb, path))
+    declared_type = str(endpoint_type or "").strip().lower()
+
+    if inferred_type is None:
+        return None
+
+    if declared_type and declared_type not in ACTION_ENDPOINT_TYPES | {"crud"}:
+        return None
+
+    if declared_type and declared_type != inferred_type:
+        return None
+
+    return verb, path, inferred_type
 
 
 def normalize_endpoint(method: Any, raw_path: Any) -> tuple[str, str] | None:
-    """Return (METHOD, canonical path) when the backend can serve it."""
+    """Return (METHOD, canonical CRUD path), or None."""
     verb = str(method or "").strip().upper()
     if verb not in HTTP_METHODS:
         return None
@@ -116,11 +158,18 @@ def normalize_endpoint(method: Any, raw_path: Any) -> tuple[str, str] | None:
         return None
 
     is_item = path.endswith("/{id}")
+
     if verb == "POST" and is_item:
         return None
+
     if verb in {"PUT", "PATCH", "DELETE"} and not is_item:
         return None
+
     return verb, path
+
+
+def is_valid_endpoint(method: Any, raw_path: Any) -> bool:
+    return normalize_endpoint(method, raw_path) is not None
 
 
 def resource_of(path: str) -> str:
@@ -128,16 +177,71 @@ def resource_of(path: str) -> str:
 
 
 def requirement_key(item: dict[str, Any]) -> tuple[str, str] | None:
-    return normalize_endpoint(item.get("method"), item.get("path"))
+    """Return the canonical method/path key for CRUD or supported actions."""
+    method = str(item.get("method", "")).strip().upper()
+    endpoint_type = item.get("endpoint_type")
+
+    action = normalize_action_endpoint(
+        method, item.get("path"), endpoint_type
+    )
+    if action:
+        return action[0], action[1]
+
+    crud = normalize_endpoint(method, item.get("path"))
+    if crud:
+        return crud
+
+    return None
+
+
+def _copy_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    """Preserve structured planner/analyzer metadata."""
+    result: dict[str, Any] = {}
+
+    for key in (
+        "endpoint_type",
+        "request_schema",
+        "response_schema",
+        "security",
+        "handler",
+        "metadata",
+    ):
+        value = item.get(key)
+        if value is not None:
+            if hasattr(value, "model_dump"):
+                value = value.model_dump()
+            result[key] = value
+
+    return result
 
 
 def normalize_requirement(item: dict[str, Any]) -> dict[str, Any] | None:
-    """Canonical requirement dict, or None when it cannot be served."""
-    key = requirement_key(item)
-    if key is None:
+    """Normalize a CRUD or supported auth requirement."""
+    if not isinstance(item, dict):
         return None
-    method, path = key
-    return {
+
+    method = str(item.get("method", "")).strip().upper()
+    action = normalize_action_endpoint(
+        method,
+        item.get("path"),
+        item.get("endpoint_type"),
+    )
+
+    if action:
+        method, path, endpoint_type = action
+    else:
+        crud = normalize_endpoint(method, item.get("path"))
+        if crud is None:
+            return None
+
+        method, path = crud
+        endpoint_type = str(item.get("endpoint_type") or "crud").lower()
+
+        # An explicitly non-CRUD action cannot pass through CRUD validation.
+        if endpoint_type not in {"crud", "upload"}:
+            return None
+
+    result = {
         "source_file": item.get("source_file", "frontend_plan"),
         "name": item.get("name") or f"{method} {path}",
         "method": method,
@@ -148,7 +252,22 @@ def normalize_requirement(item: dict[str, Any]) -> dict[str, Any] | None:
         "authentication_required": bool(
             item.get("authentication_required", False)
         ),
+        "endpoint_type": endpoint_type,
     }
+    result.update(_copy_metadata(item))
+
+    # Public endpoints must not accidentally inherit a protected flag.
+    if endpoint_type == "registration" or path in {
+        "/api/auth/login",
+        "/api/users/login",
+    }:
+        result["authentication_required"] = False
+
+    # The current-user endpoint always requires a valid access token.
+    if path == "/api/auth/me":
+        result["authentication_required"] = True
+
+    return result
 
 
 def is_builtin(item: dict[str, Any]) -> bool:
@@ -158,7 +277,7 @@ def is_builtin(item: dict[str, Any]) -> bool:
 def merge_requirements(
     *groups: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Ordered union of requirements; field lists are merged, not replaced."""
+    """Ordered union; merge fields and preserve structured metadata."""
     merged: dict[tuple[str, str], dict[str, Any]] = {}
 
     for group in groups:
@@ -166,35 +285,64 @@ def merge_requirements(
             item = normalize_requirement(raw)
             if item is None:
                 continue
+
             key = (item["method"], item["path"])
+
             if key not in merged:
                 merged[key] = item
                 continue
 
             current = merged[key]
+
             for field in ("request_fields", "response_fields"):
                 current[field] = list(
                     dict.fromkeys(current[field] + item[field])
                 )
+
             if not current["purpose"] and item["purpose"]:
                 current["purpose"] = item["purpose"]
+
             if current["source_file"] == "frontend_plan":
                 current["source_file"] = item["source_file"]
+
             current["authentication_required"] = (
                 current["authentication_required"]
                 or item["authentication_required"]
             )
 
+            for field in (
+                "request_schema",
+                "response_schema",
+                "security",
+                "handler",
+                "metadata",
+            ):
+                if field in item:
+                    if field not in current:
+                        current[field] = item[field]
+                    elif isinstance(current[field], dict) and isinstance(
+                        item[field], dict
+                    ):
+                        current[field] = {
+                            **current[field],
+                            **item[field],
+                        }
+
+            # Keep the more specific action classification.
+            if item["endpoint_type"] != "crud":
+                current["endpoint_type"] = item["endpoint_type"]
+
     return list(merged.values())
+
 
 
 def split_unsupported(
     calls: Iterable[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split detected frontend calls into (servable, unsupported).
+    """Split detected API calls into (servable, unsupported).
 
-    Only calls under /api are considered; other fetches (images, external
-    files) are ignored on purpose.
+    Action endpoints require an explicit supported endpoint_type.
+    Ordinary CRUD endpoints retain their existing behavior.
     """
     servable: list[dict[str, Any]] = []
     unsupported: list[dict[str, Any]] = []
@@ -203,16 +351,30 @@ def split_unsupported(
         path = str(call.get("path", ""))
         if not (path.startswith("/api/") or path == "/api"):
             continue
+
+        method = str(call.get("method", "")).strip().upper()
+        action_type = AUTH_ACTION_ENDPOINTS.get((method, path))
+
+        if action_type:
+            declared_type = str(
+                call.get("endpoint_type") or ""
+            ).strip().lower()
+
+            if declared_type != action_type:
+                unsupported.append(call)
+                continue
+
         item = normalize_requirement(call)
+
         if item is None:
             unsupported.append(call)
         else:
-            servable.append(call)
+            servable.append(item)
+
     return servable, unsupported
 
-
 def contract_from_frontend_plan(frontend_plan: Any) -> list[dict[str, Any]]:
-    """Servable API contract declared by the frontend plan."""
+    """Build the normalized API contract declared by the frontend plan."""
     result: list[dict[str, Any]] = []
 
     for integration in getattr(frontend_plan, "api_integrations", None) or []:
@@ -221,19 +383,11 @@ def contract_from_frontend_plan(frontend_plan: Any) -> list[dict[str, Any]]:
             if hasattr(integration, "model_dump")
             else dict(integration)
         )
-        result.append(
-            {
-                "source_file": "frontend_plan",
-                "name": item.get("name", ""),
-                "method": item.get("method", ""),
-                "path": item.get("endpoint") or item.get("path", ""),
-                "purpose": item.get("purpose", ""),
-                "request_fields": item.get("request_fields", []),
-                "response_fields": item.get("response_fields", []),
-                "authentication_required": item.get(
-                    "authentication_required", False
-                ),
-            }
-        )
+
+        result.append({
+            **item,
+            "source_file": "frontend_plan",
+            "path": item.get("endpoint") or item.get("path", ""),
+        })
 
     return merge_requirements(result)

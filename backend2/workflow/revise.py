@@ -101,6 +101,70 @@ def _parse_json(text: str) -> dict[str, Any]:
     return data
 
 
+def _clean_generated_file(content: str) -> str:
+    """Remove optional Markdown fences from a generated source file."""
+    content = (content or "").strip()
+
+    match = re.match(
+        r"^```(?:python|jsx|javascript|js|css|typescript|tsx)?\s*\n(.*?)\n```$",
+        content,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if match:
+        content = match.group(1)
+
+    if not content.strip():
+        raise ValueError("The model generated an empty file.")
+
+    return content.rstrip() + "\n"
+
+
+async def _generate_one_file(
+    llm: LLM,
+    *,
+    request: str,
+    history: str,
+    label: str,
+    original: str | None,
+    max_tokens: int = 3000,
+) -> str:
+    """Generate one complete file without wrapping its contents in JSON."""
+
+    if original is None:
+        task = "Create this new file."
+        source = ""
+    else:
+        task = "Update this existing file. Return its complete replacement."
+        source = f"\nEXISTING FILE CONTENT:\n{original}"
+
+    system = (
+        "You are an expert full-stack software engineer. "
+        "Return only the complete source code for the requested file. "
+        "Do not return JSON, Markdown explanations, or code fences. "
+        "Preserve existing functionality and use valid imports. "
+        "Do not use placeholder implementations or omit required logic. "
+        "Keep frontend API paths consistent with the backend."
+    )
+
+    prompt = (
+        f"USER REQUEST:\n{request}\n\n"
+        f"RECENT CONVERSATION:\n{history}\n\n"
+        f"FILE TO GENERATE: {label}\n"
+        f"TASK: {task}\n"
+        f"{source}\n\n"
+        "Return the complete file content only."
+    )
+
+    response = await llm(
+        prompt=prompt,
+        system=system,
+        max_tokens=max_tokens,
+        temperature=0.1,
+    )
+
+    return _clean_generated_file(response)
+
+
 async def _call_json_with_retry(
     llm: LLM,
     *,
@@ -436,19 +500,112 @@ async def revise_project(
                 "error": "That change touches files that are too large to edit in one step. Try a smaller request."}
 
     # 2) ask for edits
-    blocks = "\n\n".join(f"=== {label} ===\n{src}" for label, src in sources.items())
-    data = await _call_json_with_retry(
-    llm,
-        prompt=(
-            f"CONVERSATION:\n{_history_text(history)}\n\n"
-            f"REQUEST: {message}\n\nFILES:\n{blocks}"
-        ),
-        system=EDIT_SYSTEM,
-        max_tokens=4500,
-        temperature=0.2,
-        label="File editing",
-    )
+    
+    # 2) Generate files independently in production.
+    # Keep the injected-LLM path for existing unit tests.
+    if llm is _default_llm:
+        history_text = _history_text(history)
 
+        data = {
+            "summary": "Project changes generated.",
+            "files": [],
+            "new_files": [],
+        }
+
+        # Generate each selected existing file separately.
+        for label, original in sources.items():
+            content = await _generate_one_file(
+                llm,
+                request=message,
+                history=history_text,
+                label=label,
+                original=original,
+                max_tokens=3000,
+            )
+
+            data["files"].append({
+                "path": label,
+                "content": content,
+            })
+
+        # Ask for only the paths of required new files.
+        plan = await _call_json_with_retry(
+            llm,
+            prompt=(
+                f"USER REQUEST:\n{message}\n\n"
+                f"EXISTING FILES:\n{chr(10).join(sources.keys())}\n\n"
+                "Identify only the additional source files required. "
+                "Do not list existing files. "
+                "Use frontend/src/... for frontend files and "
+                "backend/... for backend Python files. "
+                "Return JSON: "
+                '{"summary":"short summary","new_files":["path1","path2"]}'
+            ),
+            system=(
+                "You are a software project planner. "
+                "Return only a small valid JSON object. "
+                "List only genuinely necessary new files. "
+                "Do not include file contents."
+            ),
+            max_tokens=800,
+            temperature=0.1,
+            label="New file planning",
+        )
+
+        data["summary"] = str(
+            plan.get("summary") or "Project changes generated."
+        )
+
+        # Generate each new file independently.
+        for label in plan.get("new_files", [])[:5]:
+            if not isinstance(label, str):
+                continue
+
+            path = _safe_new_path(
+                label,
+                frontend_dir,
+                backend_dir,
+            )
+
+            if path is None:
+                continue
+
+            content = await _generate_one_file(
+                llm,
+                request=message,
+                history=history_text,
+                label=label,
+                original=None,
+                max_tokens=2500,
+            )
+
+            data["new_files"].append({
+                "path": label,
+                "content": content,
+            })
+
+    else:
+        # Preserve existing test and custom LLM behaviour.
+        blocks = "\n\n".join(
+            f"=== {label} ===\n{src}"
+            for label, src in sources.items()
+        )
+
+        data = await _call_json_with_retry(
+            llm,
+            prompt=(
+                f"CONVERSATION:\n{_history_text(history)}\n\n"
+                f"REQUEST: {message}\n\nFILES:\n{blocks}"
+            ),
+            system=EDIT_SYSTEM,
+            max_tokens=4500,
+            temperature=0.2,
+            label="File editing",
+        )
+
+    
+    
+    
     # 3) apply with backups
     backups: dict[Path, str | None] = {}
     changed: list[str] = []

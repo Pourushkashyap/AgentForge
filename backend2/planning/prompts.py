@@ -147,28 +147,48 @@ Rules:
 3. Generate pages relevant to the requirements.
 4. Include reusable components and responsive design.
 5. Consider loading, empty, error, and success UI states.
-6. API CONTRACT. This frontend is generated FIRST, and a backend is then
-   generated from the API calls the frontend makes. List in api_integrations
-   every server-side call the pages need, and nothing else. The backend can
-   only serve simple JSON CRUD, so obey these limits exactly:
-   a. endpoint is "/api/<resource>" or "/api/<resource>/{id}" only.
-      <resource> is ONE lowercase plural word such as products, orders,
-      messages, categories, reviews. Never use nested paths
-      (/api/orders/{id}/items), verbs in paths (/api/cart/add), query
-      strings, or login/auth endpoints.
-   b. Allowed calls: GET /api/<resource> (list), POST /api/<resource>
-      (create), and GET, PUT, PATCH or DELETE on /api/<resource>/{id}.
-   c. Filtering, searching, sorting, cart contents and login sessions are
-      handled in the browser; do not create endpoints for them. If accounts
-      are needed, treat "users" as a plain resource and keep the session on
-      the client.
-   d. Give every integration request_fields (JSON body keys the frontend
-      sends; empty for GET and DELETE) and response_fields (keys of each
-      returned record that the UI reads). Use camelCase names exactly as the
-      UI will use them, and always include "id" in response_fields.
-   e. Add a read endpoint for every piece of business data shown on the
-      pages (products, menu items, posts...) and a POST endpoint for every
-      form the user submits (orders, contact messages, bookings...).
+6. 6. API CONTRACT AND AUTHENTICATION:
+
+   The frontend is generated first and the backend is generated from
+   the frontend API contract.
+
+   A. AUTHENTICATION DECISION:
+   - Determine from the Master Plan whether authentication is required.
+   - If authentication is required, include Login and Signup pages when
+     user registration is part of the requirements.
+   - Include AuthContext, protected routes, token handling and logout.
+   - Include Forgot Password only when requested or necessary.
+   - Do not add authentication to public websites that do not need it.
+
+   B. AUTHENTICATION API:
+   When authentication is required, include these API integrations:
+   - POST /api/auth/register
+   - POST /api/auth/login
+   - GET /api/auth/me
+   - POST /api/auth/logout
+
+   Registration request fields: name, email, password.
+   Login request fields: email, password.
+   Authentication responses should include the appropriate user
+   information and token fields.
+
+   Registration and login are public endpoints.
+   The current-user and logout endpoints require bearer authentication.
+
+   C. BUSINESS API:
+   - Use /api/<resource> and /api/<resource>/{id} for CRUD.
+   - Use action endpoints such as /api/auth/login only for
+     operations that require specialized backend logic.
+   - Never implement authentication as generic user CRUD.
+   - Preserve exact HTTP methods, paths and request/response fields.
+   - Do not drop authentication endpoints during API normalization.
+
+   D. SECURITY:
+   - Never store plaintext passwords.
+   - Never expose password hashes in API responses.
+   - Use secure password hashing and signed authentication tokens.
+   - Mark protected API integrations as authentication_required=true.
+   - Never mark registration or login as protected.
 7. Create unique task IDs and valid dependencies.
 8. Do not create circular task dependencies.
 9. Include only frontend implementation tasks.
@@ -326,6 +346,18 @@ RULES:
 25. Never store plaintext passwords or secrets in JSON files.
 26. Include authentication and authorization safeguards where needed.
 27. Return the complete valid JSON object matching the schema.   
+28. If the Master Plan requires authentication, include specialized
+    registration and login endpoints.
+29. Registration must use POST /api/auth/register.
+30. Login must use POST /api/auth/login.
+31. Registration and login must never be implemented as generic CRUD.
+32. Registration must store only securely hashed passwords.
+33. Login must verify the stored password hash and issue a signed token.
+34. Protected endpoints must specify bearer authentication.
+35. Public registration and login endpoints must not require authentication.
+36. Never expose password or password_hash in response fields.
+37. Include a users data model with a unique email field when authentication
+    and user registration are required.
 """
 
 
