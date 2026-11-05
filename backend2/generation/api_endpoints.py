@@ -336,19 +336,21 @@ def merge_requirements(
 
 
 
+
+
 def split_unsupported(
     calls: Iterable[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split detected API calls into (servable, unsupported).
+    """Split detected API calls into servable and unsupported calls.
 
     Action endpoints require an explicit supported endpoint_type.
-    Ordinary CRUD endpoints retain their existing behavior.
     """
     servable: list[dict[str, Any]] = []
     unsupported: list[dict[str, Any]] = []
 
     for call in calls or []:
         path = str(call.get("path", ""))
+
         if not (path.startswith("/api/") or path == "/api"):
             continue
 
@@ -372,6 +374,8 @@ def split_unsupported(
             servable.append(item)
 
     return servable, unsupported
+
+
 
 def contract_from_frontend_plan(frontend_plan: Any) -> list[dict[str, Any]]:
     """Build the normalized API contract declared by the frontend plan."""

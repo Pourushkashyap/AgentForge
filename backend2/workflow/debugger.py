@@ -132,6 +132,14 @@ def _candidate_files(
     if issue.get("file"):
         names.append(str(issue["file"]))
     names += re.findall(r"[\w./\\-]+\.(?:py|jsx?|json)", issue.get("message", ""))
+    if issue.get("stage") == "authentication":
+        message = issue.get("message", "").lower()
+        if "signup" in message or "registration" in message:
+            names.append("src/pages/Signup.jsx")
+        if "login" in message or "sign in" in message:
+            names.append("src/pages/Login.jsx")
+        if "route" in message or "import" in message:
+            names.append("src/App.jsx")
 
     for name in names:
         name = name.replace("\\", "/").lstrip("./")
@@ -142,11 +150,35 @@ def _candidate_files(
                 found.append(candidate)
                 break
     if issue.get("stage") == "runtime":
-        found += _files_from_runtime_error(issue.get("message", ""), frontend_dir, found)
-    if not found and issue.get("stage") == "runtime":
-        main_py = backend_dir / "main.py"
-        if main_py.is_file():
-            found.append(main_py.resolve())
+        message = issue.get("message", "")
+        found += _files_from_runtime_error(message, frontend_dir, found)
+        # API smoke diagnostics include the failing route. Search backend route
+        # declarations and route-registration files before considering main.py.
+        route_match = re.search(r"\b(?:GET|POST|PUT|PATCH|DELETE)\s+(/[^\s:'\"]+)", message, re.I)
+        if route_match:
+            route = route_match.group(1).rstrip("/")
+            for path in sorted(backend_dir.rglob("*.py")):
+                if any(part in {".venv", "venv", "__pycache__", "site-packages"} for part in path.parts):
+                    continue
+                try:
+                    source = path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                # Route may be declared directly or split across router prefix + decorator.
+                route_leaf = route.rsplit("/", 1)[-1]
+                if (route in source or route_leaf in source
+                        or re.search(r"include_router\\s*\\(", source)):
+                    found.append(path.resolve())
+        # Keep stable order and only use main.py as last-resort context.
+        unique = []
+        for path in found:
+            if path not in unique and path.is_file():
+                unique.append(path)
+        if not unique:
+            main_py = backend_dir / "main.py"
+            if main_py.is_file():
+                unique.append(main_py.resolve())
+        return unique[:MAX_FILES]
     return found
 
 

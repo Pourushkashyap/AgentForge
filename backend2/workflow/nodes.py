@@ -19,6 +19,7 @@ from typing import Any
 from workflow.debugger import debug_project
 from workflow.state import resolve_options
 from workflow.validators import (
+    check_authentication,
     check_backend_static,
     check_contract,
     check_frontend_static,
@@ -279,6 +280,9 @@ async def validate_node(state, config=None):
 
     issues = check_backend_static(backend_dir)
     issues += check_frontend_static(frontend_dir)
+    issues += check_authentication(
+        frontend_dir, state.get("frontend_plan"), state.get("api_contract") or []
+    )
     issues += scan_for_secrets(state["project_root"])
     issues += check_contract(
         state.get("actual_requirements") or state.get("requirements_list") or [],
@@ -305,9 +309,17 @@ async def debug_node(state, config=None):
     attempt = int(state.get("debug_attempts", 0)) + 1
     fixes = await debug_project(
         state.get("issues") or [], state["backend_dir"], state["frontend_dir"])
-    return {"debug_attempts": attempt, "fixes": fixes,
-            "events": [_event("debug", f"Attempt {attempt}: {len(fixes)} fixes applied",
-                              "warning" if not fixes else "info")]}
+    previous_fixes = list(state.get("fixes") or [])
+    all_fixes = previous_fixes + fixes
+    applied = sum(1 for item in fixes if item.get("method") in {"llm", "deterministic"})
+    rejected = [item for item in fixes if item.get("code") in {"llm_rejected", "llm_error"}]
+    detail = f"Attempt {attempt}: {applied} repair(s) applied"
+    if rejected:
+        detail += f", {len(rejected)} repair issue(s)"
+    return {"debug_attempts": attempt, "fixes": all_fixes,
+            "events": [_event("debug", detail,
+                              "warning" if not applied or rejected else "info",
+                              fixes=fixes)]}
 
 
 @graph_node("finalize")

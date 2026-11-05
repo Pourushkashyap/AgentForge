@@ -273,6 +273,114 @@ def check_contract(
     return issues
 
 
+
+def _auth_page_requirements(plan: Any, endpoints: list[dict[str, Any]] | None) -> tuple[bool, bool]:
+    """Infer whether login/registration pages are part of this project."""
+    pages = getattr(plan, "pages", []) or []
+    signals = []
+    for page in pages:
+        if isinstance(page, dict):
+            name, route = page.get("name", ""), page.get("route", "")
+        else:
+            name, route = getattr(page, "name", ""), getattr(page, "route", "")
+        signals.append((str(name).strip().lower(), str(route).strip().lower().rstrip("/")))
+
+    paths = {
+        str(item.get("path") or item.get("endpoint") or "").lower().rstrip("/")
+        for item in (endpoints or []) if isinstance(item, dict)
+    }
+    login = any(route == "/login" or name in {"login", "sign in", "signin"}
+                for name, route in signals)
+    signup = any(route in {"/signup", "/sign-up", "/register"}
+                 or name in {"signup", "sign up", "register", "registration"}
+                 for name, route in signals)
+    login = login or any(path.endswith("/auth/login") for path in paths)
+    signup = signup or any(path.endswith(("/auth/register", "/auth/signup", "/auth/sign-up"))
+                           for path in paths)
+    return login or signup, signup
+
+
+def check_authentication(
+    frontend_dir: str | Path,
+    plan: Any,
+    endpoints: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate the generated auth pages and wiring without assuming a UI library.
+
+    This is intentionally static: API availability and real credential flows are
+    verified by connected-runtime/browser tests when those options are enabled.
+    """
+    frontend = Path(frontend_dir)
+    login_required, signup_required = _auth_page_requirements(plan, endpoints)
+    if not login_required and not signup_required:
+        return []
+
+    stage = "authentication"
+    issues: list[dict[str, Any]] = []
+    src = frontend / "src"
+    app_file = src / "App.jsx"
+    app_text = app_file.read_text(encoding="utf-8", errors="ignore") if app_file.is_file() else ""
+
+    def add(message: str, file: str, code: str) -> None:
+        issues.append(make_issue(stage, message, code=code, file=file, auto_fixable=True))
+
+    required_pages = []
+    if login_required:
+        required_pages.append(("Login", "/login", "email", "password", "/signup"))
+    if signup_required:
+        required_pages.append(("Signup", "/signup", "name", "email", "/login"))
+
+    for component, route, first_field, second_field, opposite_route in required_pages:
+        rel = f"src/pages/{component}.jsx"
+        page = src / "pages" / f"{component}.jsx"
+        if not page.is_file():
+            add(f"Required authentication page is missing: {rel}.", "src/App.jsx", "auth_page_missing")
+            continue
+        content = page.read_text(encoding="utf-8", errors="ignore")
+        # Verify App imports the dedicated component and maps the exact route.
+        if not re.search(r"import\s+" + component + r"\s+from\s+['\"]\.?/[^'\"]*" + component + r"\.jsx?['\"]", app_text):
+            add(f"App.jsx must import {component} from {rel}.", "src/App.jsx", "auth_import_missing")
+        route_ok = False
+        for tag in re.findall(r"<Route\b[^>]*>", app_text, flags=re.S):
+            path_match = re.search(r"\bpath\s*=\s*['\"]([^'\"]+)", tag)
+            element_match = re.search(r"element\s*=\s*\{\s*<([A-Za-z_$][\w$]*)", tag)
+            if path_match and element_match and path_match.group(1).rstrip("/") == route:
+                route_ok = element_match.group(1) == component
+                break
+        if not route_ok:
+            add(f"Route {route} must render <{component} />.", "src/App.jsx", "auth_route_mismatch")
+
+        lowered = content.lower()
+        has_form = re.search(r"<(?:form|AuthForm)\b", content, re.I)
+        has_submit = re.search(r"onSubmit\s*=", content, re.I)
+        if not has_form or not has_submit:
+            add(f"{component} must render a form/AuthForm with an onSubmit handler.", rel, "auth_form_missing")
+        for field in (first_field, second_field):
+            field_pattern = (r"(?:name|type|id)\s*=\s*['\"]" + re.escape(field) + r"['\"]")
+            if not re.search(field_pattern, content, re.I):
+                add(f"{component} must contain a {field} field.", rel, "auth_field_missing")
+        if not re.search(r"(?:to|href)\s*=\s*['\"]" + re.escape(opposite_route) + r"['\"]", content):
+            add(f"{component} must link to {opposite_route}.", rel, "auth_cross_link_missing")
+
+    return issues
+
+def _runtime_file_hint(message: str) -> str | None:
+    """Extract a generated source-file path from runtime diagnostics, if present."""
+    if not message:
+        return None
+
+    # Prefer explicit project-relative paths emitted by backend/browser diagnostics.
+    patterns = (
+        r"(?i)(?:^|[\s\[(])((?:backend|frontend)[/\\][^\s\]:)]+\.(?:py|js|jsx|ts|tsx))",
+        r"(?i)(?:file|source)\s*[:=]\s*['\"]?([^'\"\s]+\.(?:py|js|jsx|ts|tsx))",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, message)
+        if match:
+            return match.group(1).replace("\\", "/")
+    return None
+
+
 def check_runtime(
     frontend_dir: str | Path,
     backend_dir: str | Path,
@@ -298,7 +406,11 @@ def check_runtime(
                 "backend2 folder to catch page crashes automatically.",
                 code="browser_unavailable", severity="warning",
                 auto_fixable=False)]
-        return [make_issue("runtime", message[-3000:], code="runtime_failure")]
+        return [make_issue(
+            "runtime", message[-8000:], code="runtime_failure",
+            file=_runtime_file_hint(message),
+            auto_fixable=True,
+        )]
     return []
 
 

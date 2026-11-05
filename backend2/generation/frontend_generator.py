@@ -571,6 +571,17 @@ Rules:
      paths and JavaScript-compatible exports only.
 
 5. If FRONTEND PLAN contains a backend_api_contract, use real API calls for server-owned data and do not create mock modules for that data. Use local static data only for genuinely static content. Without a contract, local mock modules may be used.
+5.2. AUTHENTICATION FILE CONTRACT (MANDATORY when authentication is required):
+     - Include src/pages/Login.jsx with default export Login.
+     - Include src/pages/Signup.jsx with default export Signup whenever registration is supported.
+     - These must be two separate files and two separate page components. Never reuse Login as Signup or render the same component for both routes.
+     - Include src/App.jsx routes: path="/login" renders <Login /> and path="/signup" renders <Signup />.
+     - Include the correct imports for both page components in App.jsx.
+     - Login form fields: email and password. Signup form fields: name, email and password.
+     - Use distinct headings ("Log In" / "Sign In" for login and "Create Account" / "Sign Up" for signup).
+     - The signup page must contain a link to /login; the login page must contain a link to /signup.
+     - Follow the exact backend API contract for request fields and response fields. Do not assume token field names.
+     - Do not place both forms in one component and switch only the heading or button label.
 5.1. When a contract is provided, plan one src/api/<resource>Api.js file per
      resource (named exports only, for example getProducts and createOrder)
      and let pages, hooks and context providers import those functions.
@@ -683,6 +694,11 @@ IMAGE HANDLING
 IMPLEMENTATION QUALITY
 
 - Preserve valid imports, exports, component props, and routing.
+- AUTHENTICATION: if this file is src/pages/Login.jsx, implement ONLY the login page
+  with email/password fields and a link to /signup. If this file is
+  src/pages/Signup.jsx, implement ONLY the registration page with name/email/password
+  fields and a link to /login. Never render the Login form from Signup.jsx or vice versa.
+  In src/App.jsx, map /login to <Login /> and /signup to <Signup /> using separate imports.
 - Reuse existing shared components where practical.
 - Keep interactions functional, not merely decorative.
 - When adding a new feature, include its required components and
@@ -888,6 +904,87 @@ def _validate_manifest(data: dict) -> list[dict]:
 
 
 
+def _authentication_requirements(
+    plan: FrontendPlan,
+    api_contract: list[dict] | None,
+) -> tuple[bool, bool]:
+    """Return (login_required, signup_required) from routes and API contract."""
+    page_signals = []
+    for page in getattr(plan, "pages", []) or []:
+        name = str(getattr(page, "name", "") or "").lower()
+        route = str(getattr(page, "route", "") or "").lower().rstrip("/")
+        page_signals.append((name, route))
+
+    contract_paths = set()
+    for item in api_contract or []:
+        if not isinstance(item, dict):
+            continue
+        contract_paths.add(str(item.get("path") or item.get("endpoint") or "").lower())
+
+    login_api = any(path.endswith("/auth/login") for path in contract_paths)
+    signup_api = any(
+        path.endswith(("/auth/register", "/auth/signup", "/auth/sign-up"))
+        for path in contract_paths
+    )
+    login_page = any(
+        route == "/login" or name in {"login", "sign in", "signin"}
+        for name, route in page_signals
+    )
+    signup_page = any(
+        route in {"/signup", "/sign-up", "/register"}
+        or name in {"signup", "sign up", "register", "registration"}
+        for name, route in page_signals
+    )
+
+    login_required = login_api or login_page
+    signup_required = signup_api or signup_page
+    # A registration endpoint implies that the app also needs a login page.
+    if signup_required:
+        login_required = True
+    return login_required, signup_required
+
+
+def _ensure_auth_manifest(
+    plan: FrontendPlan,
+    manifest: list[dict],
+    api_contract: list[dict] | None,
+) -> list[dict]:
+    """Make essential auth page files deterministic instead of trusting the LLM."""
+    login_required, signup_required = _authentication_requirements(plan, api_contract)
+    required = []
+    if login_required:
+        required.append({
+            "path": "src/pages/Login.jsx",
+            "purpose": "Dedicated login page with email and password fields",
+            "default_export": "Login",
+            "named_exports": [],
+        })
+    if signup_required:
+        required.append({
+            "path": "src/pages/Signup.jsx",
+            "purpose": "Dedicated registration page with name, email and password fields",
+            "default_export": "Signup",
+            "named_exports": [],
+        })
+
+    by_path = {item["path"]: item for item in manifest}
+    for item in required:
+        existing = by_path.get(item["path"])
+        if existing:
+            existing.update(item)
+        else:
+            manifest.append(item)
+            by_path[item["path"]] = item
+
+    if len(manifest) > MAX_FILES:
+        raise ValueError(
+            "Authentication requires dedicated Login/Signup files, but the "
+            f"frontend manifest exceeds the {MAX_FILES}-file limit. "
+            "Merge non-essential files or increase MAX_FILES."
+        )
+    return manifest
+
+
 async def _generate_manifest(
     plan: FrontendPlan,
     api_contract: list[dict] | None = None,
@@ -938,6 +1035,7 @@ async def _generate_manifest(
             manifest = _validate_manifest(
                 _parse_json_object(response, "Frontend file planner")
             )
+            manifest = _ensure_auth_manifest(plan, manifest, api_contract)
             print(
                 f"Frontend manifest created: {len(manifest)} files "
                 f"(limit: {MAX_FILES})."
@@ -1403,7 +1501,10 @@ def _validate_context_contracts(
 
 
 def _validate_project(
-    project_dir: Path, manifest: list[dict]
+    project_dir: Path,
+    manifest: list[dict],
+    plan: FrontendPlan | None = None,
+    api_contract: list[dict] | None = None,
 ) -> dict[str, list[str]]:
     """Return {file_path: [problem, ...]} for every file that needs repair."""
     problems: dict[str, list[str]] = {}
@@ -1513,6 +1614,57 @@ def _validate_project(
                             f"{contract['default_export'] if contract else None}, "
                             f"named={sorted(t_named) or 'none'}.",
                         )
+    # Semantic authentication checks: a successful JSX build is not enough.
+    login_required, signup_required = (
+        _authentication_requirements(plan, api_contract)
+        if plan is not None else (False, False)
+    )
+    app_path = "src/App.jsx"
+    app_text = texts.get(app_path, "")
+    if login_required or signup_required:
+        required_auth_pages = []
+        if login_required:
+            required_auth_pages.append(("Login", "src/pages/Login.jsx", "/login"))
+        if signup_required:
+            required_auth_pages.append(("Signup", "src/pages/Signup.jsx", "/signup"))
+
+        for component, page_path, route in required_auth_pages:
+            if page_path not in texts:
+                add(app_path, f"Authentication page file is missing: {page_path}.")
+                continue
+            import_pattern = (
+                r"import\s+" + re.escape(component)
+                + r"""\s+from\s+['"]\.?/[^'"]*"""
+                + re.escape(component) + r"""\.jsx['"]"""
+            )
+            if not re.search(import_pattern, app_text):
+                add(app_path, f"App.jsx must import {component} from {page_path}.")
+            route_tags = re.findall(r"<Route\b[^>]*>", app_text, flags=re.S)
+            mapped = False
+            for tag in route_tags:
+                path_match = re.search(r"""\bpath\s*=\s*['"]([^'"]+)['"]""", tag)
+                element_match = re.search(r"element\s*=\s*\{\s*<([A-Za-z_$][\w$]*)", tag)
+                if path_match and element_match and path_match.group(1).rstrip("/") == route:
+                    mapped = element_match.group(1) == component
+                    break
+            if not mapped:
+                add(app_path, f"Route {route} must render <{component} />.")
+
+        login_text = texts.get("src/pages/Login.jsx", "")
+        signup_text = texts.get("src/pages/Signup.jsx", "")
+        if login_required and login_text:
+            if not re.search(r"""type\s*=\s*['"]email['"]|name\s*=\s*['"]email['"]""", login_text, re.I):
+                add("src/pages/Login.jsx", "Login page must contain an email input.")
+            if not re.search(r"""type\s*=\s*['"]password['"]|name\s*=\s*['"]password['"]""", login_text, re.I):
+                add("src/pages/Login.jsx", "Login page must contain a password input.")
+        if signup_required and signup_text:
+            if not re.search(r"""type\s*=\s*['"]text['"]|name\s*=\s*['"]name['"]""", signup_text, re.I):
+                add("src/pages/Signup.jsx", "Signup page must contain a name input.")
+            if not re.search(r"""type\s*=\s*['"]email['"]|name\s*=\s*['"]email['"]""", signup_text, re.I):
+                add("src/pages/Signup.jsx", "Signup page must contain an email input.")
+            if not re.search(r"""type\s*=\s*['"]password['"]|name\s*=\s*['"]password['"]""", signup_text, re.I):
+                add("src/pages/Signup.jsx", "Signup page must contain a password input.")
+
     context_problems = _validate_context_contracts(
         project_dir, manifest, texts
     )
@@ -1839,7 +1991,7 @@ async def generate_frontend(
     frontend_plan: FrontendPlan,
     output_dir: str | Path = "generated_projects",
     overwrite: bool = False,
-    strict: bool = False,
+    strict: bool = True,
     api_contract: list[dict] | None = None,
     validate_runtime: bool = True,
     resume: bool = False,
@@ -1910,7 +2062,7 @@ async def generate_frontend(
 
     # ---- 2. validate, then repair only the broken files ----------------
     by_path = {f["path"]: f for f in manifest}
-    problems = _validate_project(project_dir, manifest)
+    problems = _validate_project(project_dir, manifest, frontend_plan, api_contract)
 
     for repair_pass in range(1, MAX_REPAIR_PASSES + 1):
         if not problems:
@@ -1936,7 +2088,7 @@ async def generate_frontend(
                 api_contract=api_contract,
             )
             (project_dir / path).write_text(fixed.rstrip() + "\n", encoding="utf-8")
-        problems = _validate_project(project_dir, manifest)
+        problems = _validate_project(project_dir, manifest, frontend_plan, api_contract)
 
     
     if problems:
@@ -1964,12 +2116,36 @@ async def generate_frontend(
 
     # ---- 3c. Every context hook must have its provider mounted ---------
     wiring = validate_provider_wiring(project_dir)
+    for wiring_attempt in range(1, 3):
+        if not wiring:
+            break
+        diagnostic = "Context provider wiring is broken:\\n- " + "\\n- ".join(wiring)
+        print(
+            f"\\nProvider wiring validation failed "
+            f"(repair {wiring_attempt}/2); sending diagnostics to the fix agent..."
+        )
+        repaired = await _repair_files_from_error(
+            project_dir,
+            frontend_plan,
+            manifest,
+            api_contract,
+            diagnostic,
+            "React context/provider wiring",
+        )
+        if not repaired:
+            break
+        (project_dir / "src" / "main.jsx").write_text(
+            build_main_jsx(project_dir), encoding="utf-8"
+        )
+        wiring = validate_provider_wiring(project_dir)
+
     if wiring:
         if strict:
             raise ValueError(
-                "Context provider wiring is broken:\n- " + "\n- ".join(wiring)
+                "Context provider wiring remains broken after 2 repair attempts:\\n- "
+                + "\\n- ".join(wiring)
             )
-        print("WARNING: context provider wiring problems:\n- " + "\n- ".join(wiring))
+        print("WARNING: context provider wiring problems:\\n- " + "\\n- ".join(wiring))
         problems = {**problems, "(provider wiring)": wiring}
 
     # ---- 4. Production build, with automatic repair of syntax errors ----

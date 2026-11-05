@@ -16,6 +16,7 @@ IMPORTANT:
 Return ONLY valid JSON with these exact fields:
 
 {
+  "business_name": "string",
   "project_name": "string",
   "project_goal": "string",
   "architecture": "string",
@@ -147,15 +148,21 @@ Rules:
 3. Generate pages relevant to the requirements.
 4. Include reusable components and responsive design.
 5. Consider loading, empty, error, and success UI states.
-6. 6. API CONTRACT AND AUTHENTICATION:
+6. API CONTRACT AND AUTHENTICATION:
 
    The frontend is generated first and the backend is generated from
    the frontend API contract.
 
    A. AUTHENTICATION DECISION:
    - Determine from the Master Plan whether authentication is required.
-   - If authentication is required, include Login and Signup pages when
-     user registration is part of the requirements.
+   - If authentication is required, include a dedicated Login page at
+     route "/login".
+   - If user registration is supported, include a separate Signup page at
+     route "/signup". Never combine Login and Signup into one page/component.
+   - Give the pages distinct names ("Login" and "Signup") and distinct routes.
+   - Login contains email and password fields. Signup contains name, email,
+     and password fields.
+   - The Login page links to "/signup"; the Signup page links to "/login".
    - Include AuthContext, protected routes, token handling and logout.
    - Include Forgot Password only when requested or necessary.
    - Do not add authentication to public websites that do not need it.

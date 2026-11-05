@@ -72,6 +72,12 @@ def _endpoint_contract(backend_plan) -> list[dict[str, Any]]:
             "authentication_required": item.get(
                 "authentication_required", False
             ),
+            "endpoint_type": item.get("endpoint_type", "crud"),
+            "request_schema": item.get("request_schema", {}),
+            "response_schema": item.get("response_schema", {}),
+            "security": item.get("security", {}),
+            "handler": item.get("handler", {}),
+            "metadata": item.get("metadata", {}),
         })
     return contract
 
@@ -136,30 +142,55 @@ async def generate_project_pipeline(
     detected = analyze_frontend_api_requirements(frontend_dir)
     servable, unsupported = split_unsupported(detected)
 
-    if unsupported:
-        listing = ", ".join(
-            f"{c.get('method')} {c.get('path')}" for c in unsupported
+    # Repair unsupported API calls in a bounded loop. Re-analyze the actual
+    # source after every rewrite; never assume that a successful LLM response
+    # means the contract is fixed.
+    max_api_repair_rounds = 3
+    for repair_round in range(1, max_api_repair_rounds + 1):
+        if not unsupported:
+            break
+
+        before = {
+            (str(item.get("method", "")).upper(), str(item.get("path", "")))
+            for item in unsupported
+        }
+        listing = ", ".join(f"{method} {path}" for method, path in sorted(before))
+        print(
+            f"Repairing unsupported API calls "
+            f"(round {repair_round}/{max_api_repair_rounds}): {listing}"
         )
-        print(f"Repairing unsupported API calls: {listing}")
+
         rewritten = await repair_unsupported_api_calls(
             frontend_dir,
             frontend_plan,
             merge_requirements(planned_contract, servable),
             unsupported,
         )
-        if rewritten:
-            _validate_frontend_build(frontend_dir)
-            detected = analyze_frontend_api_requirements(frontend_dir)
-            servable, unsupported = split_unsupported(detected)
+        if not rewritten:
+            print("API repair agent made no changes; stopping repair loop.")
+            break
+
+        # A repair is accepted only if the modified frontend still builds.
+        _validate_frontend_build(frontend_dir)
+        detected = analyze_frontend_api_requirements(frontend_dir)
+        servable, unsupported = split_unsupported(detected)
+
+        after = {
+            (str(item.get("method", "")).upper(), str(item.get("path", "")))
+            for item in unsupported
+        }
+        if after >= before:
+            print("API repair did not reduce unsupported calls; stopping to avoid repeated fixes.")
+            break
 
     if unsupported:
-        listing = "\n".join(
+        listing = "\\n".join(
             f"- {c.get('method')} {c.get('path')} ({c.get('source_file')})"
             for c in unsupported
         )
         raise ValueError(
-            "Generated frontend calls API routes the backend cannot serve:\n"
-            + listing
+            "Generated frontend still calls API routes the backend cannot serve "
+            f"after {max_api_repair_rounds} repair rounds:\\n" + listing
         )
 
     actual = merge_requirements(servable)

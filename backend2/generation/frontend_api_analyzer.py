@@ -2,7 +2,7 @@
 import re
 from pathlib import Path
 from typing import Any
-
+from generation.api_endpoints import AUTH_ACTION_ENDPOINTS
 
 HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE"}
 
@@ -235,6 +235,7 @@ def _extract_response_fields(source: str) -> list[str]:
     return list(dict.fromkeys(RESPONSE_FIELD_RE.findall(source)))
 
 
+
 def _add_requirement(
     requirements: dict,
     source_file: str,
@@ -246,6 +247,7 @@ def _add_requirement(
     base_match = BASE_PREFIX_RE.match(url)
     if base_match and BASE_NAME_RE.search(base_match.group(1)):
         url = base_match.group(2)
+
     url = TEMPLATE_PARAM_RE.sub("{id}", url)
 
     # Only local absolute paths are analyzed.
@@ -253,23 +255,56 @@ def _add_requirement(
         return
 
     path = url.split("?", 1)[0].rstrip("/") or "/"
+    method = method.upper()
+
     key = (method, path)
 
+    # Infer endpoint type only for explicitly supported action routes.
+    endpoint_type = AUTH_ACTION_ENDPOINTS.get(key)
+
+    # These endpoints require an existing access token.
+    protected_paths = {
+        "/api/auth/me",
+        "/api/auth/logout",
+        "/api/auth/refresh",
+    }
+
+    authentication_required = path in protected_paths
+
     if key not in requirements:
-        requirements[key] = {
+        item = {
             "source_file": source_file,
             "method": method,
             "path": path,
             "purpose": f"{method} request used by frontend",
             "request_fields": request_fields or [],
             "response_fields": response_fields or [],
-            "authentication_required": False,
+            "authentication_required": authentication_required,
         }
+
+        if endpoint_type:
+            item["endpoint_type"] = endpoint_type
+
+        requirements[key] = item
+
     else:
         item = requirements[key]
+
         item["request_fields"] = list(
-            dict.fromkeys(item["request_fields"] + (request_fields or []))
+            dict.fromkeys(
+                item["request_fields"] + (request_fields or [])
+            )
         )
+
         item["response_fields"] = list(
-            dict.fromkeys(item["response_fields"] + (response_fields or []))
+            dict.fromkeys(
+                item["response_fields"] + (response_fields or [])
+            )
         )
+
+        item["authentication_required"] = (
+            item["authentication_required"] or authentication_required
+        )
+
+        if endpoint_type:
+            item["endpoint_type"] = endpoint_type
