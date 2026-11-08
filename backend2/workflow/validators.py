@@ -100,7 +100,13 @@ def check_backend_static(backend_dir: str | Path) -> list[dict[str, Any]]:
 
     requirements = backend / "requirements.txt"
     wanted = ("fastapi", "uvicorn")
-    text = requirements.read_text(encoding="utf-8").lower() if requirements.is_file() else ""
+    try:
+        text = requirements.read_text(encoding="utf-8").lower() if requirements.is_file() else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        issues.append(make_issue(
+            stage, f"Could not read requirements.txt: {exc}",
+            code="bad_requirements_encoding", file="requirements.txt"))
+        text = ""
     missing = [name for name in wanted if name not in text]
     if missing:
         issues.append(make_issue(
@@ -112,9 +118,24 @@ def check_backend_static(backend_dir: str | Path) -> list[dict[str, Any]]:
                                  code="missing_storage",
                                  file="storage/json_store.py"))
 
-    if main_py.is_file() and "/health" not in main_py.read_text(encoding="utf-8"):
-        issues.append(make_issue(stage, "main.py has no /health route.",
-                                 code="missing_health", file="main.py"))
+    if main_py.is_file():
+        try:
+            main_source = main_py.read_text(encoding="utf-8")
+            # Ignore comments and ordinary string mentions: require an actual
+            # FastAPI route decorator whose path is /health.
+            has_health = bool(re.search(
+                r"@(?:\w+\.)?(?:get|api_route)\s*\(\s*['\"]/health/?['\"]",
+                main_source,
+                flags=re.I,
+            ))
+            if not has_health:
+                issues.append(make_issue(
+                    stage, "main.py has no GET /health route decorator.",
+                    code="missing_health", file="main.py"))
+        except (OSError, UnicodeDecodeError) as exc:
+            issues.append(make_issue(
+                stage, f"Could not read main.py for health-route validation: {exc}",
+                code="bad_encoding", file="main.py"))
 
     data_dir = backend / "data"
     if data_dir.is_dir():
@@ -274,16 +295,23 @@ def check_contract(
 
 
 
-def _auth_page_requirements(plan: Any, endpoints: list[dict[str, Any]] | None) -> tuple[bool, bool]:
-    """Infer whether login/registration pages are part of this project."""
-    pages = getattr(plan, "pages", []) or []
-    signals = []
-    for page in pages:
-        if isinstance(page, dict):
-            name, route = page.get("name", ""), page.get("route", "")
-        else:
-            name, route = getattr(page, "name", ""), getattr(page, "route", "")
-        signals.append((str(name).strip().lower(), str(route).strip().lower().rstrip("/")))
+def _page_value(page: Any, key: str, default: str = "") -> str:
+    if isinstance(page, dict):
+        return str(page.get(key) or default)
+    return str(getattr(page, key, default) or default)
+
+
+def _auth_page_requirements(
+    plan: Any, endpoints: list[dict[str, Any]] | None
+) -> tuple[bool, bool]:
+    """Infer auth requirements from either Pydantic plans or plain dictionaries."""
+    pages = (plan.get("pages", []) if isinstance(plan, dict)
+             else getattr(plan, "pages", [])) or []
+    signals = [
+        (_page_value(page, "name").strip().lower(),
+         _page_value(page, "route").strip().lower().rstrip("/"))
+        for page in pages
+    ]
 
     paths = {
         str(item.get("path") or item.get("endpoint") or "").lower().rstrip("/")
@@ -295,9 +323,43 @@ def _auth_page_requirements(plan: Any, endpoints: list[dict[str, Any]] | None) -
                  or name in {"signup", "sign up", "register", "registration"}
                  for name, route in signals)
     login = login or any(path.endswith("/auth/login") for path in paths)
-    signup = signup or any(path.endswith(("/auth/register", "/auth/signup", "/auth/sign-up"))
-                           for path in paths)
+    signup = signup or any(
+        path.endswith(("/auth/register", "/auth/signup", "/auth/sign-up"))
+        for path in paths
+    )
+    # A registration flow must have a way for the new user to sign in.
     return login or signup, signup
+
+
+def _auth_route_component(app_text: str, route: str) -> str | None:
+    """Return the component used by a literal React Router route."""
+    for tag in re.findall(r"<Route\b[^>]*>", app_text, flags=re.S):
+        path_match = re.search(r"\bpath\s*=\s*['\"]([^'\"]+)", tag)
+        element_match = re.search(
+            r"element\s*=\s*\{\s*<([A-Za-z_$][\w$]*)", tag
+        )
+        if path_match and path_match.group(1).rstrip("/") == route:
+            return element_match.group(1) if element_match else None
+    return None
+
+
+def _auth_default_export(content: str, component: str) -> bool:
+    patterns = (
+        rf"export\s+default\s+function\s+{component}\b",
+        rf"function\s+{component}\b[\s\S]{{0,1200}}?export\s+default\s+{component}\b",
+        rf"const\s+{component}\s*=\s*(?:async\s*)?\(",
+        rf"const\s+{component}\s*=\s*(?:async\s*)?function\b",
+    )
+    if re.search(patterns[0], content):
+        return True
+    # Named function/const followed by a default export.
+    return bool(re.search(patterns[1], content) or (
+        re.search(patterns[2], content) and
+        re.search(rf"export\s+default\s+{component}\s*;", content)
+    ) or (
+        re.search(patterns[3], content) and
+        re.search(rf"export\s+default\s+{component}\s*;", content)
+    ))
 
 
 def check_authentication(
@@ -305,14 +367,14 @@ def check_authentication(
     plan: Any,
     endpoints: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Validate the generated auth pages and wiring without assuming a UI library.
+    """Check distinct auth pages, routes, forms and contract wiring.
 
-    This is intentionally static: API availability and real credential flows are
-    verified by connected-runtime/browser tests when those options are enabled.
+    This is a static guardrail, not a substitute for a real credential-flow test.
+    Runtime/browser checks are performed separately when enabled.
     """
     frontend = Path(frontend_dir)
     login_required, signup_required = _auth_page_requirements(plan, endpoints)
-    if not login_required and not signup_required:
+    if not login_required:
         return []
 
     stage = "authentication"
@@ -322,45 +384,148 @@ def check_authentication(
     app_text = app_file.read_text(encoding="utf-8", errors="ignore") if app_file.is_file() else ""
 
     def add(message: str, file: str, code: str) -> None:
-        issues.append(make_issue(stage, message, code=code, file=file, auto_fixable=True))
+        issues.append(make_issue(
+            stage, message, code=code, file=file, auto_fixable=True
+        ))
 
-    required_pages = []
-    if login_required:
-        required_pages.append(("Login", "/login", "email", "password", "/signup"))
+    required = [("Login", "/login", ("email", "password"), "/signup")]
     if signup_required:
-        required_pages.append(("Signup", "/signup", "name", "email", "/login"))
+        required.append(("Signup", "/signup", ("name", "email", "password"), "/login"))
 
-    for component, route, first_field, second_field, opposite_route in required_pages:
+    page_contents: dict[str, str] = {}
+    for component, route, fields, opposite_route in required:
         rel = f"src/pages/{component}.jsx"
         page = src / "pages" / f"{component}.jsx"
         if not page.is_file():
-            add(f"Required authentication page is missing: {rel}.", "src/App.jsx", "auth_page_missing")
+            add(f"Required authentication page is missing: {rel}.",
+                rel, "auth_page_missing")
             continue
-        content = page.read_text(encoding="utf-8", errors="ignore")
-        # Verify App imports the dedicated component and maps the exact route.
-        if not re.search(r"import\s+" + component + r"\s+from\s+['\"]\.?/[^'\"]*" + component + r"\.jsx?['\"]", app_text):
-            add(f"App.jsx must import {component} from {rel}.", "src/App.jsx", "auth_import_missing")
-        route_ok = False
-        for tag in re.findall(r"<Route\b[^>]*>", app_text, flags=re.S):
-            path_match = re.search(r"\bpath\s*=\s*['\"]([^'\"]+)", tag)
-            element_match = re.search(r"element\s*=\s*\{\s*<([A-Za-z_$][\w$]*)", tag)
-            if path_match and element_match and path_match.group(1).rstrip("/") == route:
-                route_ok = element_match.group(1) == component
-                break
-        if not route_ok:
-            add(f"Route {route} must render <{component} />.", "src/App.jsx", "auth_route_mismatch")
 
-        lowered = content.lower()
-        has_form = re.search(r"<(?:form|AuthForm)\b", content, re.I)
-        has_submit = re.search(r"onSubmit\s*=", content, re.I)
-        if not has_form or not has_submit:
-            add(f"{component} must render a form/AuthForm with an onSubmit handler.", rel, "auth_form_missing")
-        for field in (first_field, second_field):
-            field_pattern = (r"(?:name|type|id)\s*=\s*['\"]" + re.escape(field) + r"['\"]")
+        content = page.read_text(encoding="utf-8", errors="ignore")
+        page_contents[component] = content
+
+        # The page must be imported and mounted at its own route.
+        import_ok = bool(re.search(
+            rf"import\s+{component}\s+from\s+['\"](?:\./|\.\./)[^'\"]*{component}\.jsx?['\"]",
+            app_text,
+        ))
+        if not import_ok:
+            add(f"App.jsx must import {component} from {rel}.",
+                "src/App.jsx", "auth_import_missing")
+
+        actual_component = _auth_route_component(app_text, route)
+        if actual_component != component:
+            add(f"Route {route} must render <{component} />, not "
+                f"{actual_component or 'an unresolved component'}.",
+                "src/App.jsx", "auth_route_mismatch")
+
+        if not _auth_default_export(content, component):
+            add(f"{rel} must provide a default export named {component}.",
+                rel, "auth_export_mismatch")
+
+        if not re.search(r"<(?:form|AuthForm)\b", content, re.I) or not re.search(
+            r"\bonSubmit\s*=", content, re.I
+        ):
+            add(f"{component} must render a form/AuthForm with an onSubmit handler.",
+                rel, "auth_form_missing")
+
+        for field in fields:
+            # Supports standard HTML inputs and component props.
+            field_pattern = (
+                r"(?:name|type|id)\s*=\s*['\"]" + re.escape(field) + r"['\"]"
+            )
             if not re.search(field_pattern, content, re.I):
-                add(f"{component} must contain a {field} field.", rel, "auth_field_missing")
-        if not re.search(r"(?:to|href)\s*=\s*['\"]" + re.escape(opposite_route) + r"['\"]", content):
-            add(f"{component} must link to {opposite_route}.", rel, "auth_cross_link_missing")
+                add(f"{component} must contain a {field} field.",
+                    rel, "auth_field_missing")
+
+        if not re.search(
+            r"(?:to|href)\s*=\s*['\"]" + re.escape(opposite_route) + r"['\"]",
+            content,
+        ):
+            add(f"{component} must link to {opposite_route}.",
+                rel, "auth_cross_link_missing")
+
+    # Prevent the exact regression where Signup is a copy of Login.
+    if signup_required and "Login" in page_contents and "Signup" in page_contents:
+        login_text = re.sub(r"\s+", " ", page_contents["Login"]).strip()
+        signup_text = re.sub(r"\s+", " ", page_contents["Signup"]).strip()
+        if login_text == signup_text:
+            add("Login.jsx and Signup.jsx contain identical page implementations.",
+                "src/pages/Signup.jsx", "auth_pages_duplicated")
+
+    # A route must never point both auth URLs at the same page component.
+    if signup_required:
+        login_component = _auth_route_component(app_text, "/login")
+        signup_component = _auth_route_component(app_text, "/signup")
+        if login_component and signup_component and login_component == signup_component:
+            add("Login and Signup routes render the same component.",
+                "src/App.jsx", "auth_routes_share_component")
+
+    # Check API path usage only when endpoint paths are explicitly supplied.
+    # API wrappers are allowed: search all source files rather than only page files.
+    contract_paths = {
+        str(item.get("path") or item.get("endpoint") or "").rstrip("/")
+        for item in (endpoints or []) if isinstance(item, dict)
+    }
+    api_source = ""
+    for path in src.rglob("*"):
+        if path.suffix not in {".js", ".jsx", ".ts", ".tsx"} or not path.is_file():
+            continue
+        if any(part in {"node_modules", "dist", "build"} for part in path.parts):
+            continue
+        try:
+            api_source += "\n" + path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+    has_auth_transport = bool(re.search(
+        r"\bfetch\s*\(|\baxios\b|\.post\s*\(|\bapi\.(?:request|post)\b|authApi",
+        api_source,
+        flags=re.I,
+    ))
+    # Catch the common backend/frontend token naming mismatch without assuming
+    # that every project calls its token field "token".
+    login_endpoint = next((
+        item for item in (endpoints or [])
+        if isinstance(item, dict)
+        and str(item.get("path") or item.get("endpoint") or "").lower().rstrip("/").endswith("/auth/login")
+    ), None)
+    if login_endpoint:
+        response_fields = {
+            str(field).strip() for field in (login_endpoint.get("response_fields") or [])
+            if isinstance(field, (str, int))
+        }
+        token_fields = response_fields.intersection({"access_token", "token", "jwt", "id_token"})
+        if len(token_fields) == 1:
+            expected_token = next(iter(token_fields))
+            other_token = "token" if expected_token != "token" else "access_token"
+            expected_used = bool(re.search(
+                rf"(?:\.|\[\s*['\"]){re.escape(expected_token)}\b",
+                api_source,
+            ))
+            other_used = bool(re.search(
+                rf"(?:\.|\[\s*['\"]){re.escape(other_token)}\b",
+                api_source,
+            ))
+            if other_used and not expected_used:
+                add(
+                    f"Frontend reads '{other_token}' but the login contract returns "
+                    f"'{expected_token}'. Use the backend's exact token field.",
+                    "src/pages/Login.jsx", "auth_token_field_mismatch",
+                )
+    for expected_suffix, issue_code, description in (
+        ("/auth/login", "auth_login_api_missing", "login"),
+        ("/auth/register", "auth_register_api_missing", "registration"),
+    ):
+        if has_auth_transport and any(path.endswith(expected_suffix) for path in contract_paths):
+            # Permit API clients which use a configured base URL plus a relative
+            # auth suffix, but flag a conflicting endpoint spelling.
+            short = expected_suffix.removeprefix("/api")
+            if expected_suffix not in api_source and short not in api_source:
+                add(f"The frontend does not reference the contracted {description} endpoint "
+                    f"({expected_suffix}).", "src/pages/" + (
+                        "Login.jsx" if description == "login" else "Signup.jsx"
+                    ), issue_code)
 
     return issues
 

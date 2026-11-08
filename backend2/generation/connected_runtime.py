@@ -1,8 +1,4 @@
-"""Validate the generated frontend and backend running together.
-
-Runtime failures preserve HTTP response bodies and JSON decoding diagnostics so
-the debugger can identify the endpoint and source file responsible.
-"""
+"""Validate the generated frontend and backend running together."""
 from __future__ import annotations
 
 import json
@@ -61,7 +57,7 @@ def running_backend(
                     log.seek(0)
                     raise ValueError(
                         f"Generated backend did not become ready in {startup_timeout:.0f}s. "
-                        "Startup log:\\n" + log.read()[-6000:]
+                        "Startup log:\n" + log.read()[-6000:]
                     )
                 time.sleep(0.25)
             yield base_url
@@ -79,11 +75,9 @@ def _request_json(url: str) -> tuple[int, Any, str | None]:
     """Return status, parsed body, and diagnostic (including HTTP error body)."""
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
-            raw = response.read()
-            status = response.status
+            raw, status = response.read(), response.status
     except urllib.error.HTTPError as exc:
-        raw = exc.read()
-        status = exc.code
+        raw, status = exc.read(), exc.code
     except Exception as exc:
         return 0, None, f"{type(exc).__name__}: {exc}"
 
@@ -107,66 +101,98 @@ def _get_json(url: str) -> tuple[int, Any]:
 
 def _format_failure(method: str, path: str, status: int,
                     body: Any, diagnostic: str | None) -> str:
-    detail = diagnostic or (json.dumps(body, ensure_ascii=False, default=str)[:1200]
-                            if body is not None else "No response body")
+    detail = diagnostic or (
+        json.dumps(body, ensure_ascii=False, default=str)[:1200]
+        if body is not None else "No response body"
+    )
     return f"{method} {path} returned HTTP {status}: {detail}"
 
 
 def _normalise_path(path: str) -> str:
-    path = "/" + path.lstrip("/")
-    return path
+    return "/" + path.lstrip("/")
+
+
+def _expected_json_type(item: dict[str, Any], path: str, *, detail: bool = False) -> str:
+    """Resolve an optional contract hint; retain conventional defaults."""
+    hint = str(item.get("response_type") or item.get("returns") or "").lower()
+    if hint in {"list", "array"}:
+        return "list"
+    if hint in {"object", "dict"}:
+        return "object"
+    if hint in {"any", "json"}:
+        return "any"
+    if detail or path.rstrip("/").lower().endswith(("/health", "/auth/me", "/profile")):
+        return "object"
+    return "list"
 
 
 def smoke_check_api(base_url: str, endpoints: list[dict[str, Any]]) -> list[str]:
-    """GET every collection endpoint and one detail endpoint where possible."""
+    """GET collection endpoints and one detail endpoint where possible.
+
+    Endpoint dictionaries may declare ``response_type`` as list, object, or any.
+    Without a hint, collection routes default to list and known singleton routes
+    (/health, /auth/me, /profile) default to object.
+    """
     problems: list[str] = []
     first_ids: dict[str, str] = {}
-    normalised = []
+    detail_specs: list[tuple[str, str, dict[str, Any]]] = []
     for item in endpoints:
+        if not isinstance(item, dict):
+            continue
         method = str(item.get("method", "GET")).upper()
-        path = _normalise_path(str(item.get("path", "")))
-        normalised.append((method, path))
-        if method != "GET" or not path:
+        path = _normalise_path(str(item.get("path", item.get("endpoint", ""))))
+        if method != "GET" or not path or path == "/":
             continue
-        if "{id}" in path or ":id" in path:
+        marker = "{id}" if "{id}" in path else ":id" if ":id" in path else None
+        if marker:
+            detail_specs.append((path, marker, item))
             continue
+
         status, body, diagnostic = _request_json(base_url + path)
-
-        # A current-user endpoint is normally protected. During a smoke check
-        # we deliberately make anonymous requests, so 401 from /auth/me is an
-        # expected response rather than evidence of a broken backend.
-        # Keep this exception narrow: other endpoints must still return 200.
-        normalised_for_auth = path.rstrip("/").lower()
-        if status == 401 and normalised_for_auth.endswith("/auth/me"):
+        auth_me = path.rstrip("/").lower().endswith("/auth/me")
+        if auth_me and status == 401:
             continue
-
         if status != 200:
             problems.append(_format_failure("GET", path, status, body, diagnostic))
             continue
-        if not isinstance(body, list):
+
+        expected = _expected_json_type(item, path)
+        valid = (
+            expected == "any"
+            or (expected == "list" and isinstance(body, list))
+            or (expected == "object" and isinstance(body, dict))
+        )
+        if not valid:
             problems.append(
-                f"GET {path} returned HTTP {status}, expected a JSON list; "
+                f"GET {path} returned HTTP {status}, expected JSON {expected}; "
                 f"received {type(body).__name__}: "
                 f"{json.dumps(body, ensure_ascii=False, default=str)[:1000]}"
             )
             continue
-        if body and isinstance(body[0], dict) and body[0].get("id") is not None:
-            first_ids[path] = str(body[0]["id"])
+        if isinstance(body, list) and body and isinstance(body[0], dict):
+            record_id = body[0].get("id")
+            if record_id is not None:
+                first_ids[path.rstrip("/")] = str(record_id)
 
-    for method, path in normalised:
-        if method != "GET" or not ("{id}" in path or ":id" in path):
-            continue
-        marker = "{id}" if "{id}" in path else ":id"
+    for path, marker, item in detail_specs:
         list_path = path.replace("/" + marker, "").replace(marker, "").rstrip("/")
         record_id = first_ids.get(list_path)
         if record_id is None:
-            # Empty list means there is no valid sample item to fetch.
             continue
         detail_path = path.replace(marker, urllib.parse.quote(record_id, safe=""))
         status, body, diagnostic = _request_json(base_url + detail_path)
-        if status != 200 or not isinstance(body, dict):
+        expected = _expected_json_type(item, detail_path, detail=True)
+        valid = (
+            status == 200 and (
+                expected == "any"
+                or (expected == "object" and isinstance(body, dict))
+                or (expected == "list" and isinstance(body, list))
+            )
+        )
+        if not valid:
             problems.append(_format_failure("GET", detail_path, status, body, diagnostic))
-
+            if status == 200 and body is not None:
+                problems[-1] += f" (expected JSON {expected})"
     return problems
 
 
@@ -193,11 +219,10 @@ def validate_connected_runtime(
         if problems:
             raise ValueError(
                 "Generated backend failed API smoke checks. "
-                "Inspect the endpoint, response body, and backend route implementation:\\n- "
-                + "\\n- ".join(problems)
+                "Inspect the endpoint, response body, and backend route implementation:\n- "
+                + "\n- ".join(problems)
             )
         print(f"Backend API smoke checks passed at {base_url}")
-
         if not run_browser:
             return
 

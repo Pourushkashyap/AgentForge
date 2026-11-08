@@ -1652,12 +1652,42 @@ def _validate_project(
 
         login_text = texts.get("src/pages/Login.jsx", "")
         signup_text = texts.get("src/pages/Signup.jsx", "")
+
+        # Guard against the recurring regression where the generator writes the
+        # same page twice or maps both URLs to one component.
+        if login_required and signup_required and login_text and signup_text:
+            normalize = lambda value: re.sub(r"\\s+", " ", value).strip()
+            if normalize(login_text) == normalize(signup_text):
+                add("src/pages/Signup.jsx",
+                    "Login.jsx and Signup.jsx must be distinct page implementations.")
+            route_components = {}
+            for route_tag in re.findall(r"<Route\\b[^>]*>", app_text, flags=re.S):
+                path_match = re.search(r"""\\bpath\\s*=\\s*['"]([^'"]+)['"]""", route_tag)
+                component_match = re.search(
+                    r"element\\s*=\\s*\\{\\s*<([A-Za-z_$][\\w$]*)", route_tag
+                )
+                if path_match and component_match:
+                    route_components[path_match.group(1).rstrip("/")] = component_match.group(1)
+            if (route_components.get("/login") and route_components.get("/signup")
+                    and route_components["/login"] == route_components["/signup"]):
+                add(app_path, "Login and Signup routes must render different components.")
+
         if login_required and login_text:
+            if not re.search(r"<(?:form|AuthForm)\\b", login_text, re.I) or not re.search(
+                r"\\bonSubmit\\s*=", login_text, re.I
+            ):
+                add("src/pages/Login.jsx",
+                    "Login page must submit through a form/AuthForm onSubmit handler.")
             if not re.search(r"""type\s*=\s*['"]email['"]|name\s*=\s*['"]email['"]""", login_text, re.I):
                 add("src/pages/Login.jsx", "Login page must contain an email input.")
             if not re.search(r"""type\s*=\s*['"]password['"]|name\s*=\s*['"]password['"]""", login_text, re.I):
                 add("src/pages/Login.jsx", "Login page must contain a password input.")
         if signup_required and signup_text:
+            if not re.search(r"<(?:form|AuthForm)\\b", signup_text, re.I) or not re.search(
+                r"\\bonSubmit\\s*=", signup_text, re.I
+            ):
+                add("src/pages/Signup.jsx",
+                    "Signup page must submit through a form/AuthForm onSubmit handler.")
             if not re.search(r"""type\s*=\s*['"]text['"]|name\s*=\s*['"]name['"]""", signup_text, re.I):
                 add("src/pages/Signup.jsx", "Signup page must contain a name input.")
             if not re.search(r"""type\s*=\s*['"]email['"]|name\s*=\s*['"]email['"]""", signup_text, re.I):
