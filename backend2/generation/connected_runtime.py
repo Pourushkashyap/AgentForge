@@ -31,6 +31,8 @@ def running_backend(
     if not (backend_dir / "main.py").is_file():
         raise ValueError(f"Generated backend has no main.py: {backend_dir}")
 
+    from core.dev_env import backend_env
+
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as log:
@@ -38,6 +40,7 @@ def running_backend(
             [sys.executable, "-m", "uvicorn", "main:app",
              "--host", "127.0.0.1", "--port", str(port)],
             cwd=backend_dir, stdout=log, stderr=subprocess.STDOUT,
+            env={**os.environ, **backend_env(str(backend_dir.parent.name))},
         )
         try:
             deadline = time.monotonic() + startup_timeout

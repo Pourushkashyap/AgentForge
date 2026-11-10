@@ -721,3 +721,66 @@ def test_context_contract_does_not_flag_unrelated_files():
 
     assert problems == {}
 
+
+
+def test_validate_project_accepts_valid_auth_forms(tmp_path):
+    from types import SimpleNamespace
+    from generation.frontend_generator import _validate_project
+
+    files = {
+        "src/App.jsx": '''import Login from "./pages/Login.jsx";
+import Signup from "./pages/Signup.jsx";
+export default function App() {
+  return <Routes>
+    <Route path="/login" element={<Login />} />
+    <Route path="/signup" element={<Signup />} />
+  </Routes>;
+}
+''',
+        "src/pages/Login.jsx": '''export default function Login() {
+  const handleSubmit = (event) => event.preventDefault();
+  return <form onSubmit={handleSubmit}>
+    <input type="email" name="email" />
+    <input type="password" name="password" />
+    <a href="/signup">Sign up</a>
+  </form>;
+}
+''',
+        "src/pages/Signup.jsx": '''export default function Signup() {
+  const handleSubmit = (event) => event.preventDefault();
+  return <form onSubmit={handleSubmit}>
+    <input type="text" name="name" />
+    <input type="email" name="email" />
+    <input type="password" name="password" />
+    <a href="/login">Log in</a>
+  </form>;
+}
+''',
+    }
+    manifest = []
+    for relative, content in files.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        manifest.append({
+            "path": relative,
+            "default_export": True,
+            "named_exports": [],
+        })
+
+    plan = SimpleNamespace(pages=[
+        SimpleNamespace(name="Login", route="/login"),
+        SimpleNamespace(name="Signup", route="/signup"),
+    ])
+    problems = _validate_project(tmp_path, manifest, plan=plan)
+
+    auth_errors = [
+        message
+        for messages in problems.values()
+        for message in messages
+        if any(word in message.lower() for word in (
+            "authentication", "login page", "signup page",
+            "login.jsx", "signup.jsx", "route /login", "route /signup",
+        ))
+    ]
+    assert auth_errors == []

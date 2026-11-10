@@ -581,6 +581,14 @@ Rules:
      - Use distinct headings ("Log In" / "Sign In" for login and "Create Account" / "Sign Up" for signup).
      - The signup page must contain a link to /login; the login page must contain a link to /signup.
      - Follow the exact backend API contract for request fields and response fields. Do not assume token field names.
+     - Define EVERY auth function with ONE object parameter and call it with ONE object, in the API module,
+       the context provider and the pages alike: login({ email, password }) and register({ name, email, password }).
+       Never mix positional arguments (login(email, password)) with object parameters.
+     - The login response is { access_token, token_type, expires_in, user }: store access_token (send it as
+       'Authorization: Bearer <access_token>') and set the current user from `user`. There is no top-level
+       token, id or email. The register response is only the public user (no token): log in afterwards.
+     - A page calls the context function ONCE with what the user typed and navigates afterwards. It never calls
+       the API itself and then passes the results to the context function.
      - Do not place both forms in one component and switch only the heading or button label.
 5.1. When a contract is provided, plan one src/api/<resource>Api.js file per
      resource (named exports only, for example getProducts and createOrder)

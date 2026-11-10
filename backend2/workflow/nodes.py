@@ -233,7 +233,9 @@ def _endpoint_contract(backend_plan) -> list[dict[str, Any]]:
     contract = []
     for endpoint in backend_plan.endpoints or []:
         item = endpoint.model_dump() if hasattr(endpoint, "model_dump") else dict(endpoint)
-        contract.append({
+        from generation.api_endpoints import apply_canonical_auth
+
+        contract.append(apply_canonical_auth({
             "name": item.get("name", ""),
             "method": str(item.get("method", "GET")).upper(),
             "path": item.get("path", ""),
@@ -241,7 +243,7 @@ def _endpoint_contract(backend_plan) -> list[dict[str, Any]]:
             "request_fields": item.get("request_fields", []),
             "response_fields": item.get("response_fields", []),
             "authentication_required": item.get("authentication_required", False),
-        })
+        }))
     return contract
 
 
@@ -283,6 +285,9 @@ async def validate_node(state, config=None):
     issues += check_authentication(
         frontend_dir, state.get("frontend_plan"), state.get("api_contract") or []
     )
+    from workflow.flow_checks import SOFT_CODES, all_flow_issues
+
+    issues += all_flow_issues(Path(frontend_dir), Path(backend_dir), state.get("api_contract") or [])
     issues += scan_for_secrets(state["project_root"])
     issues += check_contract(
         state.get("actual_requirements") or state.get("requirements_list") or [],
@@ -295,6 +300,14 @@ async def validate_node(state, config=None):
             check_runtime, frontend_dir, backend_dir, state.get("api_contract") or [],
             static_routes(state["frontend_plan"]),
             run_browser=options["validate_browser"])
+
+    # Heuristic data-flow findings must not turn a build that is otherwise fine into a dead end:
+    # once the auto-fixer had its attempts, whatever is left is reported as a warning.
+    if state.get("debug_attempts", 0) >= options["max_debug_attempts"]:
+        for issue in issues:
+            if issue.get("code") in SOFT_CODES and issue["severity"] == "error":
+                issue["severity"] = "warning"
+                issue["message"] += " (could not be fixed automatically; ask the chat to fix it)"
 
     errors = sum(1 for i in issues if i["severity"] == "error")
     warnings = len(issues) - errors

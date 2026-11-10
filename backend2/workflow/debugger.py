@@ -27,6 +27,8 @@ MAX_TOTAL_CHARS = 24_000
 MAX_FILES = 3
 WRITABLE_SUFFIXES = {".py", ".js", ".jsx", ".json"}
 
+from workflow.flow_checks import FLOW_CODES  # noqa: E402
+
 HEALTH_ROUTE = '\n\n@app.get("/health")\ndef health():\n    return {"status": "ok"}\n'
 
 SYSTEM_PROMPT = (
@@ -54,6 +56,8 @@ def apply_deterministic_fixes(
     handled: set[int] = set()
     backend_dir = Path(backend_dir)
     wiring_done = False
+    flow_done = False
+    flow_left: set[tuple[str, str]] = set()
 
     for index, issue in enumerate(issues):
         if issue.get("severity") != "error":
@@ -107,6 +111,19 @@ def apply_deterministic_fixes(
                                       + (", ".join(mounted) or "none needed"),
                                       "src/main.jsx", "deterministic"))
                 handled.add(index)
+
+            elif frontend_dir is not None and code in FLOW_CODES:
+                # login/register call signatures, token/user reads, route params: mechanical
+                if not flow_done:
+                    from workflow.flow_checks import all_flow_issues, fix_flow
+
+                    for applied in fix_flow(Path(frontend_dir), backend_dir):
+                        fixes.append(_fix(issue, applied["action"], applied["file"], "deterministic"))
+                    flow_done = True
+                    flow_left = {(i["code"], i.get("file", ""))
+                                 for i in all_flow_issues(Path(frontend_dir), backend_dir, None)}
+                if (code, issue.get("file", "")) not in flow_left:
+                    handled.add(index)
 
             elif code == "bad_data_json" and issue.get("file"):
                 target = (backend_dir / issue["file"]).resolve()

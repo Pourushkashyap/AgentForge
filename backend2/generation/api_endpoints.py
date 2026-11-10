@@ -57,6 +57,47 @@ ACTION_ENDPOINT_TYPES = {
 }
 
 
+# The generated backend always implements authentication the same way (see
+# backend_generator.build_auth_routes). The planner invents its own response fields
+# ("token", flat "id/name/email"), the frontend is then written against those inventions
+# and login silently breaks: the token is `undefined` and the user is never stored.
+# So the contract is overwritten with what the backend REALLY accepts and returns.
+_USER_FIELDS = ["id", "name", "email", "role"]
+_REGISTER = (["name", "email", "password"], _USER_FIELDS,
+             "Returns the public user only (NO token). After registering, send the user to "
+             "login or call login with the same email and password.")
+_LOGIN = (["email", "password"], ["access_token", "token_type", "expires_in", "user"],
+          "Returns { access_token, token_type, expires_in, user: { id, name, email, role } }. "
+          "Store access_token and send it as 'Authorization: Bearer <access_token>'. "
+          "Call it with ONE object argument: login({ email, password }).")
+CANONICAL_AUTH = {
+    "/api/auth/register": _REGISTER,
+    "/api/auth/signup": _REGISTER,
+    "/api/auth/login": _LOGIN,
+    "/api/users/login": _LOGIN,
+    "/api/auth/me": ([], _USER_FIELDS, "Returns the public user (id, name, email, role)."),
+    "/api/auth/logout": ([], ["message"], "Returns { message }. Clear the stored token on the client."),
+}
+
+
+def canonical_auth(path: str) -> tuple[list[str], list[str], str] | None:
+    return CANONICAL_AUTH.get(str(path or "").rstrip("/").lower())
+
+
+def apply_canonical_auth(item: dict[str, Any]) -> dict[str, Any]:
+    """Overwrite request/response fields of an auth endpoint with the backend's real ones."""
+    canonical = canonical_auth(item.get("path") or item.get("endpoint") or "")
+    if canonical is None:
+        return item
+    request_fields, response_fields, hint = canonical
+    item = dict(item)
+    item["request_fields"] = list(request_fields)
+    item["response_fields"] = list(response_fields)
+    purpose = str(item.get("purpose") or "").split(" || ")[0].strip()
+    item["purpose"] = (purpose + " || " if purpose else "") + hint
+    return item
+
+
 def field_name(value: Any) -> str | None:
     """Return a plain field name from 'name', 'name (string): text', etc."""
     if isinstance(value, dict):
@@ -267,7 +308,7 @@ def normalize_requirement(item: dict[str, Any]) -> dict[str, Any] | None:
     if path == "/api/auth/me":
         result["authentication_required"] = True
 
-    return result
+    return apply_canonical_auth(result)
 
 
 def is_builtin(item: dict[str, Any]) -> bool:

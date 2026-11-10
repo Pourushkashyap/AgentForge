@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import shutil
 import signal
 import socket
@@ -14,6 +15,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
+
+from core.dev_env import backend_env
 
 Notify = Callable[[str, str, str, str], None]  # (job_id, node, message, level)
 Change = Callable[[str, dict[str, Any]], None]  # (job_id, public_state)
@@ -29,10 +32,14 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-def wait_for_http(url: str, seconds: float) -> bool:
-    """True as soon as the server answers at all (any status code)."""
+def wait_for_http(url: str, seconds: float, proc: subprocess.Popen | None = None) -> bool:
+    """True as soon as the server answers at all (any status code).
+
+    Gives up at once when `proc` has already exited: no point waiting for a crashed server."""
     end = time.time() + seconds
     while time.time() < end:
+        if proc is not None and proc.poll() is not None:
+            return False
         try:
             urllib.request.urlopen(url, timeout=2)
             return True
@@ -69,6 +76,20 @@ def _popen(cmd: list[str], cwd: Path, log_path: Path, env: dict[str, str] | None
     return subprocess.Popen(
         cmd, cwd=str(cwd), stdout=log, stderr=subprocess.STDOUT,
         env={**os.environ, **(env or {})}, **kwargs)
+
+
+def failure_reason(log_path: Path, marker: str = "=== preview start") -> str:
+    """The last error line the processes wrote since this preview started."""
+    try:
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    text = text.rsplit(marker, 1)[-1]
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for line in reversed(lines):
+        if re.match(r"^(?:\w+\.)*\w*(?:Error|Exception|Exit)\b", line) or "Error:" in line:
+            return line[:300]
+    return lines[-1][:300] if lines else ""
 
 
 class PreviewManager:
@@ -144,8 +165,11 @@ class PreviewManager:
             self._set(job_id, status="starting")
             self._notify(job_id, "preview", "Starting servers", "info")
             backend_port, frontend_port = free_port(), free_port()
+            with open(log, "ab") as marker:
+                marker.write(f"\n=== preview start {time.strftime('%H:%M:%S')} ===\n".encode())
             procs = {
-                "backend": _popen(self._backend_cmd(backend_port), backend_dir, log),
+                "backend": _popen(self._backend_cmd(backend_port), backend_dir, log,
+                                  backend_env(job_id)),
                 "frontend": _popen(
                     self._frontend_cmd(frontend_port), frontend_dir, log,
                     {"VITE_API_PROXY_TARGET": f"http://127.0.0.1:{backend_port}"}),
@@ -153,10 +177,16 @@ class PreviewManager:
             with self._lock:
                 self._procs[job_id] = procs
 
-            if not wait_for_http(f"http://127.0.0.1:{backend_port}/health", BACKEND_READY_SECONDS):
-                raise RuntimeError(f"Backend did not start. See {log}")
-            if not wait_for_http(f"http://127.0.0.1:{frontend_port}/", FRONTEND_READY_SECONDS):
-                raise RuntimeError(f"Frontend did not start. See {log}")
+            if not wait_for_http(f"http://127.0.0.1:{backend_port}/health",
+                                 BACKEND_READY_SECONDS, procs["backend"]):
+                reason = failure_reason(log)
+                raise RuntimeError(f"Backend did not start" + (f": {reason}" if reason else "")
+                                   + f". See {log}")
+            if not wait_for_http(f"http://127.0.0.1:{frontend_port}/",
+                                 FRONTEND_READY_SECONDS, procs["frontend"]):
+                reason = failure_reason(log)
+                raise RuntimeError(f"Frontend did not start" + (f": {reason}" if reason else "")
+                                   + f". See {log}")
 
             url = f"http://127.0.0.1:{frontend_port}"
             self._set(job_id, status="ready", url=url, backend_port=backend_port,
@@ -192,7 +222,7 @@ class PreviewManager:
             kill_tree(old)
         port = state["backend_port"]
         proc = _popen(self._backend_cmd(port), backend_dir,
-                      backend_dir.parent / "preview.log")
+                      backend_dir.parent / "preview.log", backend_env(job_id))
         with self._lock:
             self._procs.setdefault(job_id, {})["backend"] = proc
         wait_for_http(f"http://127.0.0.1:{port}/health", BACKEND_READY_SECONDS)
