@@ -285,7 +285,9 @@ async def validate_node(state, config=None):
     issues += check_authentication(
         frontend_dir, state.get("frontend_plan"), state.get("api_contract") or []
     )
-    from workflow.flow_checks import SOFT_CODES, all_flow_issues
+    from workflow.flow_checks import SOFT_CODES, all_flow_issues, harden_frontend
+
+    harden_frontend(Path(frontend_dir))   # always-safe repairs (state setters, string calls)
 
     issues += all_flow_issues(Path(frontend_dir), Path(backend_dir), state.get("api_contract") or [])
     issues += scan_for_secrets(state["project_root"])
@@ -295,11 +297,13 @@ async def validate_node(state, config=None):
 
     if not has_errors(issues) and options["validate_connected"]:
         from generation.connected_runtime import static_routes
+        from generation.runtime_routes import discover_routes
 
+        routes = discover_routes(
+            Path(frontend_dir), Path(backend_dir), static_routes(state["frontend_plan"]))
         issues += await asyncio.to_thread(
             check_runtime, frontend_dir, backend_dir, state.get("api_contract") or [],
-            static_routes(state["frontend_plan"]),
-            run_browser=options["validate_browser"])
+            routes, run_browser=options["validate_browser"])
 
     # Heuristic data-flow findings must not turn a build that is otherwise fine into a dead end:
     # once the auto-fixer had its attempts, whatever is left is reported as a warning.

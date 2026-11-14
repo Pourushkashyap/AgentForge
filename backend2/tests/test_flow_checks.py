@@ -356,3 +356,120 @@ def test_replace_once_tolerates_indentation_and_rejects_ambiguity():
     except ValueError:
         return
     raise AssertionError("an ambiguous patch must be rejected")
+
+
+# ---- "query.toLowerCase is not a function" --------------------------------------
+SEARCH_PAGE = '''import React, { useState } from "react";
+import SearchBar from "../components/SearchBar.jsx";
+
+export default function Tutors({ tutors }) {
+  const [query, setQuery] = useState("");
+  const shown = tutors.filter((t) => t.name.toLowerCase().includes(query.toLowerCase()));
+  return (
+    <div>
+      <input value={query} onChange={setQuery} />
+      <SearchBar onSearch={setQuery} />
+      {shown.length}
+    </div>
+  );
+}
+'''
+
+
+def _write(root, rel, text):
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_event_stored_in_string_state_is_detected_and_fixed(tmp_path):
+    fe = tmp_path / "frontend"
+    page = _write(fe, "src/pages/Tutors.jsx", SEARCH_PAGE)
+    issues = fc.check_event_setters(fe)
+    assert [i["code"] for i in issues] == ["event_passed_to_state"] * 2
+    fixes = fc.fix_event_setters(fe)
+    assert fixes and fc.check_event_setters(fe) == []
+    text = page.read_text()
+    assert "onChange={(value) => setQuery(value && value.target ? value.target.value : value)}" in text
+    assert fc.fix_event_setters(fe) == []                      # idempotent
+
+
+def test_string_state_setters_are_the_only_ones_touched(tmp_path):
+    fe = tmp_path / "frontend"
+    _write(fe, "src/pages/A.jsx", 'const [items, setItems] = useState([]);\n<List onChange={setItems} />\n')
+    assert fc.check_event_setters(fe) == [] and fc.fix_event_setters(fe) == []
+
+
+def test_string_calls_cannot_crash_on_objects_any_more(tmp_path):
+    fe = tmp_path / "frontend"
+    page = _write(fe, "src/pages/B.jsx",
+                  'const a = query.toLowerCase();\nconst b = filters.search.trim();\nconst c = user.name.toLowerCase();\n')
+    assert fc.fix_string_calls(fe)
+    text = page.read_text()
+    assert 'String(query ?? "").toLowerCase()' in text
+    assert 'String(filters.search ?? "").trim()' in text
+    assert "user.name.toLowerCase()" in text                    # other names untouched
+    assert fc.fix_string_calls(fe) == []                       # idempotent
+
+
+def test_harden_frontend_repairs_the_whole_crash_class(tmp_path):
+    fe = tmp_path / "frontend"
+    page = _write(fe, "src/pages/Tutors.jsx", SEARCH_PAGE)
+    assert fc.harden_frontend(fe)
+    text = page.read_text()
+    assert "onChange={setQuery}" not in text and 'String(query ?? "").toLowerCase()' in text
+
+
+# ---- which pages the browser opens ----------------------------------------------
+def test_browser_check_opens_sub_pages_and_pages_the_plan_did_not_list(tmp_path):
+    from generation.runtime_routes import discover_routes
+
+    fe, be = tmp_path / "frontend", tmp_path / "backend"
+    _write(fe, "src/App.jsx", '''import { Routes, Route } from "react-router-dom";
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<Home />} />
+      <Route path="/login" element={<Login />} />
+      <Route path="/tutors" element={<Tutors />} />
+      <Route path="/tutors/:id" element={<TutorDetails />} />
+      <Route path="*" element={<NotFound />} />
+    </Routes>
+  );
+}
+''')
+    _write(be, "data/tutors.json", json.dumps([{"id": "t-42", "name": "Asha"}]))
+    routes = discover_routes(fe, be, plan_routes=["/", "/tutors"])
+    assert routes[0] == "/"
+    assert "/tutors/t-42" in routes          # the real id from the seed data
+    assert "/login" in routes                # not in the plan
+    assert not any("*" in r or ":" in r for r in routes)
+    assert routes.index("/tutors/t-42") < routes.index("/login")   # sub pages come first
+
+
+def test_unknown_collections_fall_back_to_id_1_and_the_list_is_capped(tmp_path):
+    from generation.runtime_routes import discover_routes
+
+    fe = tmp_path / "frontend"
+    many = "\n".join(f'<Route path="/p{i}" element={{<P{i} />}} />' for i in range(30))
+    _write(fe, "src/App.jsx", f'<Routes>\n<Route path="/jobs/:id" element={{<J />}} />\n{many}\n</Routes>\n')
+    routes = discover_routes(fe, None)
+    assert "/jobs/1" in routes and len(routes) <= 12
+
+
+def test_chat_fixes_the_toLowerCase_crash_without_the_model(tmp_path, monkeypatch):
+    fe, be = project(tmp_path)
+    fc.fix_flow(fe, be)
+    (fe / "src/App.jsx").write_text(APP.replace('/job/5', '/jobs/5'), encoding="utf-8")
+    _write(fe, "src/pages/Tutors.jsx", SEARCH_PAGE)
+
+    async def boom(**_):
+        raise AssertionError("the model must not be needed")
+
+    monkeypatch.setattr(revise, "_default_llm", boom)
+    result = asyncio.run(revise.revise_project(
+        fe, be, "This page crashed: query.toLowerCase is not a function", build_check=lambda d: None))
+    assert result["ok"], result
+    text = (fe / "src/pages/Tutors.jsx").read_text()
+    assert "onChange={setQuery}" not in text and 'String(query ?? "").toLowerCase()' in text

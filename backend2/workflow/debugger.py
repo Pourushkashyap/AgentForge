@@ -56,6 +56,7 @@ def apply_deterministic_fixes(
     handled: set[int] = set()
     backend_dir = Path(backend_dir)
     wiring_done = False
+    wiring_left: set[str] = set()
     flow_done = False
     flow_left: set[tuple[str, str]] = set()
 
@@ -103,14 +104,24 @@ def apply_deterministic_fixes(
                         and "must be used within" in issue.get("message", "")))):
                 # a page uses a context hook whose provider is never mounted
                 if not wiring_done:
-                    from generation.provider_wiring import repair_project_main
+                    from generation.auth_context import ensure_auth_context
+                    from generation.provider_wiring import (
+                        repair_project_main, validate_provider_wiring)
 
+                    created = ensure_auth_context(Path(frontend_dir))   # useAuth defined nowhere
+                    if created:
+                        fixes.append(_fix(issue, "Created the missing auth context (useAuth / AuthProvider): "
+                                          + ", ".join(created), created[0], "deterministic"))
                     mounted = repair_project_main(Path(frontend_dir))
                     wiring_done = True
-                    fixes.append(_fix(issue, "Mounted providers in src/main.jsx: "
-                                      + (", ".join(mounted) or "none needed"),
-                                      "src/main.jsx", "deterministic"))
-                handled.add(index)
+                    if mounted:
+                        fixes.append(_fix(issue, "Mounted providers in src/main.jsx: "
+                                          + ", ".join(mounted), "src/main.jsx", "deterministic"))
+                    wiring_left = set(validate_provider_wiring(Path(frontend_dir)))
+                # "none needed" is not a fix: only an issue that really disappeared is handled,
+                # everything else goes on to the model instead of looping on a no-op.
+                if issue.get("message") not in wiring_left:
+                    handled.add(index)
 
             elif frontend_dir is not None and code in FLOW_CODES:
                 # login/register call signatures, token/user reads, route params: mechanical

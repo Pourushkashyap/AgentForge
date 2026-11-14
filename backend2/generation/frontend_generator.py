@@ -215,7 +215,7 @@ def _validate_frontend_runtime(
             env=env,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=240,
             check=False,
         )
 

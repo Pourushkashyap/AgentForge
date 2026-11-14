@@ -403,7 +403,8 @@ AUTH_INTENT_RE = re.compile(
     r"\b4(?:01|22)\b|unprocessable|password|session|token|account", re.IGNORECASE)
 FLOW_INTENT_RE = re.compile(
     AUTH_INTENT_RE.pattern + r"|sub\s*-?page|route|\blinks?\b|navigat|\b404\b|not found|blank|"
-    r"doesn.?t open|detail", re.IGNORECASE)
+    r"doesn.?t open|not open|detail|crash|not a function|undefined|cannot read|tolowercase|"
+    r"white screen|runtime", re.IGNORECASE)
 BUG_RE = re.compile(
     r"not working|doesn.?t work|isn.?t working|error|fix|fail|crash|bug|broken|can.?t|cannot|"
     r"unable|issue|problem|\b4\d\d\b|wrong|not (?:able|moving|opening)", re.IGNORECASE)

@@ -327,6 +327,15 @@ def validate_provider_wiring(project_dir: Path) -> list[str]:
 
     # A hook called with no matching context file at all.
     known_hooks = {h for c in contexts for h in c.hooks}
+    for text in files.values():                      # custom hooks live outside src/context too
+        known_hooks |= {m.group("name") for m in _HOOK_DECL_RE.finditer(text)}
+        known_hooks |= {m.group(1) for m in re.finditer(
+            r"export\s+default\s+(?:function\s+)?(use[A-Z][\w$]*)\b", text)}
+        for block in _EXPORT_BLOCK_RE.findall(text):
+            for part in block.split(","):
+                name = re.split(r"\s+as\s+", part.strip())[-1].strip()
+                if re.fullmatch(r"use[A-Z][\w$]*", name):
+                    known_hooks.add(name)
     for rel, text in files.items():
         if rel.startswith("context/"):
             continue

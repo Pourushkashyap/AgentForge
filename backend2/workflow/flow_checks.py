@@ -996,10 +996,10 @@ def fix_login_consumers(frontend_dir: Path, backend_dir: Path) -> list[dict[str,
 # ============================================================================
 FLOW_CODES = {
     "auth_call_mismatch", "auth_response_mismatch", "auth_payload_mismatch",
-    "route_param_mismatch", "link_to_missing_route",
+    "route_param_mismatch", "link_to_missing_route", "event_passed_to_state",
 }
 # heuristic findings that must never stop a build that is otherwise fine
-SOFT_CODES = FLOW_CODES
+SOFT_CODES = FLOW_CODES | {"unmounted_provider"}
 
 
 def all_flow_issues(frontend_dir: Path, backend_dir: Path | None,
@@ -1009,6 +1009,7 @@ def all_flow_issues(frontend_dir: Path, backend_dir: Path | None,
     checks = [
         lambda: check_auth_calls(frontend_dir),
         lambda: check_routes(frontend_dir),
+        lambda: check_event_setters(frontend_dir),
         lambda: check_auth_payloads(frontend_dir, backend_dir, endpoints) if backend_dir else [],
         lambda: check_login_consumers(frontend_dir, backend_dir) if backend_dir else [],
     ]
@@ -1030,13 +1031,94 @@ def all_flow_issues(frontend_dir: Path, backend_dir: Path | None,
 def fix_flow(frontend_dir: Path, backend_dir: Path | None) -> list[dict[str, Any]]:
     """Apply every mechanical repair (no LLM tokens). Returns [{file, action}]."""
     fixes: list[dict[str, Any]] = []
-    steps = [lambda: fix_auth_calls(frontend_dir), lambda: fix_route_params(frontend_dir)]
+    steps = [lambda: fix_auth_calls(frontend_dir), lambda: fix_route_params(frontend_dir),
+             lambda: harden_frontend(frontend_dir)]
     if backend_dir:
         steps += [lambda: fix_login_consumers(frontend_dir, backend_dir),
                   lambda: fix_auth_response_reads(frontend_dir, backend_dir)]
     for step in steps:
         try:
             fixes += step()
+        except Exception:
+            continue
+    return fixes
+
+
+# ============================================================================
+# "x.toLowerCase is not a function": events and objects stored in string state
+# ============================================================================
+# `<input onChange={setQuery}>` (or <SearchBar onChange={setQuery}>) stores the whole event in a
+# string state; the next render calls query.toLowerCase() and the page crashes. Components also
+# disagree on whether a callback gets the event or the value. The adapter below accepts both.
+_STRING_STATE = re.compile(r"const\s*\[\s*(\w+)\s*,\s*(set\w+)\s*\]\s*=\s*useState\(\s*(?:\"\"|''|``)\s*\)")
+_EVENT_PROPS = ("onChange", "onInput", "onSearch", "onSelect", "onQueryChange", "onValueChange")
+_STRING_NAMES = r"(?:query|search|searchTerm|searchQuery|term|keyword|filter|q|text)"
+_STRING_CALL = re.compile(
+    r"(?<![\w$.])((?:[A-Za-z_$][\w$]*\.)*" + _STRING_NAMES + r")\.(toLowerCase|toUpperCase|trim)\(\)")
+
+
+def _setter_sites(text: str) -> list[tuple[int, int, str]]:
+    sites = []
+    for state in _STRING_STATE.finditer(text):
+        setter = state.group(2)
+        for prop in _EVENT_PROPS:
+            for m in re.finditer(rf"\b{prop}=\{{\s*{setter}\s*\}}", text):
+                sites.append((m.start(), m.end(), f"{prop}|{setter}"))
+    return sites
+
+
+def check_event_setters(frontend_dir: Path) -> list[dict[str, Any]]:
+    issues = []
+    for label, path in src_files(frontend_dir).items():
+        for _, _, what in _setter_sites(read(path)):
+            prop, setter = what.split("|")
+            issues.append(make_issue(
+                "runtime",
+                f"src/{label}: {prop}={{{setter}}} hands the browser event (or whatever the "
+                f"component passes) straight to a string state, so a later call such as "
+                f"{setter[3:].lower()}.toLowerCase() crashes the page. Use "
+                f"{prop}={{(e) => {setter}(e.target.value)}} or accept a string explicitly.",
+                code="event_passed_to_state", file=f"src/{label}", auto_fixable=True))
+    return issues
+
+
+def fix_event_setters(frontend_dir: Path) -> list[dict[str, Any]]:
+    fixes = []
+    for label, path in src_files(frontend_dir).items():
+        text = read(path)
+        sites = _setter_sites(text)
+        if not sites:
+            continue
+        for start, end, what in sorted(sites, reverse=True):
+            prop, setter = what.split("|")
+            adapter = (f"{prop}={{(value) => {setter}(value && value.target ? "
+                       f"value.target.value : value)}}")
+            text = text[:start] + adapter + text[end:]
+        path.write_text(text, encoding="utf-8")
+        fixes.append({"file": f"src/{label}",
+                      "action": f"{len(sites)} state setter(s) now receive the typed value, not the event"})
+    return fixes
+
+
+def fix_string_calls(frontend_dir: Path) -> list[dict[str, Any]]:
+    """query.toLowerCase() -> String(query ?? "").toLowerCase(): never crashes on an object."""
+    fixes = []
+    for label, path in src_files(frontend_dir).items():
+        text = read(path)
+        new, count = _STRING_CALL.subn(lambda m: f'String({m.group(1)} ?? "").{m.group(2)}()', text)
+        if count:
+            path.write_text(new, encoding="utf-8")
+            fixes.append({"file": f"src/{label}",
+                          "action": f"{count} string call(s) made safe against non-string values"})
+    return fixes
+
+
+def harden_frontend(frontend_dir: Path) -> list[dict[str, Any]]:
+    """Always-safe repairs run on every generated project before it is validated."""
+    fixes: list[dict[str, Any]] = []
+    for step in (fix_event_setters, fix_string_calls):
+        try:
+            fixes += step(Path(frontend_dir))
         except Exception:
             continue
     return fixes
