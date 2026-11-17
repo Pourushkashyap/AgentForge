@@ -2,7 +2,26 @@
 @tailwind components;
 @tailwind utilities;
 
-html, body, #root { height: 100%; }
-body { @apply bg-zinc-950 text-zinc-100 antialiased; }
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 8px; }
+@layer base {
+  html, body, #root { height: 100%; }
+  body { @apply bg-ink font-sans text-fog antialiased; }
+  ::selection { background: rgba(139, 92, 246, 0.4); }
+  :focus-visible { outline: 2px solid #8B5CF6; outline-offset: 2px; }
+  textarea:focus-visible, input:focus-visible { outline: none; }
+  * { scrollbar-width: thin; scrollbar-color: #2D2942 transparent; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #2D2942; border-radius: 8px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3F3860; }
+  code { @apply rounded bg-plate px-1 py-0.5 font-mono text-[0.85em] text-fog; }
+}
+
+@layer components {
+  .dot-grid {
+    background-image: radial-gradient(rgba(165, 156, 200, 0.22) 1px, transparent 1px);
+    background-size: 22px 22px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-forge, .animate-rise { animation: none; }
+}
